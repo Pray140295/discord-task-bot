@@ -164,17 +164,17 @@ function createAssignButtons() {
   return new ActionRowBuilder()
     .addComponents(
       new ButtonBuilder()
-        .setCustomId("assign_Huynh")
+        .setCustomId("assign_HUYNH")
         .setLabel("Huynh")
         .setStyle(ButtonStyle.Primary),
 
       new ButtonBuilder()
-        .setCustomId("assign_Ngân")
+        .setCustomId("assign_NANCY")
         .setLabel("Ngân")
         .setStyle(ButtonStyle.Success),
 
       new ButtonBuilder()
-        .setCustomId("assign_Ngọc")
+        .setCustomId("assign_NGỌC")
         .setLabel("Ngọc")
         .setStyle(ButtonStyle.Secondary)
     );
@@ -191,14 +191,14 @@ function createStatusButtons(requestId) {
 
       new ButtonBuilder()
         .setCustomId(
-          `status_Đang Làm_${requestId}`
+          `status_In Progress_${requestId}`
         )
         .setLabel("Đang Làm")
         .setStyle(ButtonStyle.Primary),
 
       new ButtonBuilder()
         .setCustomId(
-          `status_Chờ Review_${requestId}`
+          `status_Review_${requestId}`
         )
         .setLabel("Chờ Review")
         .setStyle(ButtonStyle.Success),
@@ -346,13 +346,13 @@ client.on(
 
         const designerChannelMap = {
 
-          "Huynh":
+          "HUYNH":
             "1511559274625765480",
 
-          "Ngân":
+          "NANCY":
             "1511559338043641916",
 
-          "Ngọc":
+          "NGỌC":
             "1511559317298352288"
         };
 
