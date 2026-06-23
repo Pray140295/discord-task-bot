@@ -480,17 +480,22 @@ client.on(
 
     } catch(err) {
 
-      console.log(err);
+  console.log(
+    "ASSIGN ERROR:",
+    err
+  );
 
-      await interaction.reply({
+  try {
 
-        content:
-          "❌ Có lỗi xảy ra.",
+    await interaction.reply({
+      content:
+        "❌ Có lỗi xảy ra.",
+      ephemeral:true
+    });
 
-        ephemeral:true
-      });
-    }
-  }
+  } catch(e) {}
+
+}
 );
 
 // ======================================================
