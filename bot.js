@@ -126,11 +126,11 @@ function createTaskEmbed(task) {
       },
       {
         name:"Độ gấp",
-        value:String(task.urgent || "-")
+        value:String(task.priority || "-")
       },
       {
         name:"Kích thước",
-        value:String(task.size || "-")
+        value:String(task.format || "-")
       },
       {
         name:"Số lượng",
