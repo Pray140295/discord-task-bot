@@ -164,17 +164,17 @@ function createAssignButtons() {
   return new ActionRowBuilder()
     .addComponents(
       new ButtonBuilder()
-        .setCustomId("assign_HUYNH")
+        .setCustomId("assign_Huynh")
         .setLabel("HUYNH")
         .setStyle(ButtonStyle.Primary),
 
       new ButtonBuilder()
-        .setCustomId("assign_NANCY")
+        .setCustomId("assign_Nancy")
         .setLabel("NANCY")
         .setStyle(ButtonStyle.Success),
 
       new ButtonBuilder()
-        .setCustomId("assign_NGỌC")
+        .setCustomId("assign_Ngọc")
         .setLabel("NGỌC")
         .setStyle(ButtonStyle.Secondary)
     );
