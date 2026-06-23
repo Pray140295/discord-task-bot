@@ -164,17 +164,17 @@ function createAssignButtons() {
   return new ActionRowBuilder()
     .addComponents(
       new ButtonBuilder()
-        .setCustomId("assign_Huynh")
+        .setCustomId("assign_HUYNH")
         .setLabel("HUYNH")
         .setStyle(ButtonStyle.Primary),
 
       new ButtonBuilder()
-        .setCustomId("assign_Nancy")
+        .setCustomId("assign_NANCY")
         .setLabel("NANCY")
         .setStyle(ButtonStyle.Success),
 
       new ButtonBuilder()
-        .setCustomId("assign_Ngọc")
+        .setCustomId("assign_NGỌC")
         .setLabel("NGỌC")
         .setStyle(ButtonStyle.Secondary)
     );
@@ -354,14 +354,23 @@ client.on(
         const requestId =
           embed.fields[0].value;
 
-        await apiPost({
+       console.log("ASSIGN REQUEST");
 
-          action:"assign",
+          console.log({
+            requestId,
+            designer
+          });
+          
+          const result = await apiPost({
+          
+            action:"assign",
+          
+            requestId,
+          
+            designer
+          });
 
-          requestId,
-
-          designer
-        });
+console.log(result);
 
         const task =
           await apiPost({
