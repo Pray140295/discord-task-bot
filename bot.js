@@ -165,7 +165,7 @@ function createAssignButtons() {
     .addComponents(
       new ButtonBuilder()
         .setCustomId("assign_HUYNH")
-        .setLabel("Huynh")
+        .setLabel("HUYNH")
         .setStyle(ButtonStyle.Primary),
 
       new ButtonBuilder()
@@ -175,7 +175,7 @@ function createAssignButtons() {
 
       new ButtonBuilder()
         .setCustomId("assign_NGỌC")
-        .setLabel("Ngọc")
+        .setLabel("NGỌC")
         .setStyle(ButtonStyle.Secondary)
     );
 }
