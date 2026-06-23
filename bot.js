@@ -170,7 +170,7 @@ function createAssignButtons() {
 
       new ButtonBuilder()
         .setCustomId("assign_NANCY")
-        .setLabel("Ngân")
+        .setLabel("NANCY")
         .setStyle(ButtonStyle.Success),
 
       new ButtonBuilder()
