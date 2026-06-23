@@ -218,14 +218,28 @@ function createStatusButtons(requestId) {
 
 async function monitorNewTasks() {
 
+  console.log("========== MONITOR STARTED ==========");
+
   setInterval(async () => {
+
+    console.log("Polling unsynced...");
 
     try {
 
       const tasks =
         await apiGet("unsynced");
 
-      if (!tasks.length) {
+      console.log(
+        "Tasks returned:",
+        JSON.stringify(tasks)
+      );
+
+      if (!tasks || !tasks.length) {
+
+        console.log(
+          "No unsynced tasks."
+        );
+
         return;
       }
 
@@ -236,28 +250,38 @@ async function monitorNewTasks() {
 
       for (const task of tasks) {
 
-        const msg = await channel.send({
+        console.log(
+          "Sending task:",
+          task.requestId
+        );
 
-          embeds: [
-            createTaskEmbed(task)
-          ],
+        const msg =
+          await channel.send({
 
-          components: [
-            createAssignButtons()
-          ]
-        });
+            embeds: [
+              createTaskEmbed(task)
+            ],
+
+            components: [
+              createAssignButtons()
+            ]
+          });
 
         await apiPost({
 
           action:"discordInfo",
 
-          requestId:task.requestId,
+          requestId:
+            task.requestId,
 
-          messageId:msg.id,
+          messageId:
+            msg.id,
 
-          channelId:channel.id,
+          channelId:
+            channel.id,
 
-          messageUrl:msg.url
+          messageUrl:
+            msg.url
         });
 
         console.log(
@@ -268,7 +292,10 @@ async function monitorNewTasks() {
 
     } catch(err) {
 
-      console.log(err.message);
+      console.log(
+        "MONITOR ERROR:",
+        err
+      );
     }
 
   }, 15000);
