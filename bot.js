@@ -217,85 +217,50 @@ function createStatusButtons(requestId) {
 // ======================================================
 
 async function monitorNewTasks() {
-
   console.log("========== MONITOR STARTED ==========");
 
   setInterval(async () => {
-
     console.log("Polling unsynced...");
 
     try {
+      const tasks = await apiGet("unsynced");
 
-      const tasks =
-        await apiGet("unsynced");
+      // 🛑 THÊM ĐOẠN NÀY ĐỂ CHẶN SPAM NGAY LẬP TỨC
+      if (!Array.isArray(tasks)) {
+        console.log("❌ LỖI: API không trả về một Mảng (Array). Có thể Apps Script đang bị lỗi sập hoặc sai quyền. Dữ liệu nhận được:", tasks);
+        return; // Thoát ra ngay, không chạy vòng lặp để tránh spam Discord
+      }
 
-      console.log(
-        "Tasks returned:",
-        JSON.stringify(tasks)
-      );
+      console.log("Tasks returned:", JSON.stringify(tasks));
 
       if (!tasks || !tasks.length) {
-
-        console.log(
-          "No unsynced tasks."
-        );
-
+        console.log("No unsynced tasks.");
         return;
       }
 
-      const channel =
-        await client.channels.fetch(
-          CHANNEL_TASK_NEW
-        );
+      const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
 
       for (const task of tasks) {
+        console.log("Sending task:", task.requestId);
 
-        console.log(
-          "Sending task:",
-          task.requestId
-        );
-
-        const msg =
-          await channel.send({
-
-            embeds: [
-              createTaskEmbed(task)
-            ],
-
-            components: [
-              createAssignButtons()
-            ]
-          });
-
-        await apiPost({
-
-          action:"discordInfo",
-
-          requestId:
-            task.requestId,
-
-          messageId:
-            msg.id,
-
-          channelId:
-            channel.id,
-
-          messageUrl:
-            msg.url
+        const msg = await channel.send({
+          embeds: [ createTaskEmbed(task) ],
+          components: [ createAssignButtons() ]
         });
 
-        console.log(
-          "Task sent:",
-          task.requestId
-        );
+        await apiPost({
+          action: "discordInfo",
+          requestId: task.requestId,
+          messageId: msg.id,
+          channelId: channel.id,
+          messageUrl: msg.url
+        });
+
+        console.log("Task sent:", task.requestId);
       }
 
     } catch(err) {
-
-      console.log(
-        "MONITOR ERROR:",
-        err
-      );
+      console.log("MONITOR ERROR:", err);
     }
 
   }, 15000);
