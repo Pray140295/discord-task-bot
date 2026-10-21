@@ -23,22 +23,17 @@ const client = new Client({
 // ======================================================
 
 const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL;
-const MANAGER_ROLE_ID = process.env.MANAGER_ROLE_ID;
-const CHANNEL_TASK_NEW = process.env.CHANNEL_TASK_NEW;
-const CHANNEL_REVIEW = process.env.CHANNEL_REVIEW;
-const CHANNEL_DONE = process.env.CHANNEL_DONE;
+const MANAGER_ROLE_ID   = process.env.MANAGER_ROLE_ID;
+const CHANNEL_TASK_NEW  = process.env.CHANNEL_TASK_NEW;
+const CHANNEL_REVIEW    = process.env.CHANNEL_REVIEW;
+const CHANNEL_DONE      = process.env.CHANNEL_DONE;
 
 // ======================================================
 // KEEP ALIVE
 // ======================================================
 
-app.get("/", (req, res) => {
-  res.send("Bot Online");
-});
-
-app.get("/ping", (req, res) => {
-  res.send("pong");
-});
+app.get("/", (req, res) => res.send("Bot Online"));
+app.get("/ping", (req, res) => res.send("pong"));
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Web Server Running");
@@ -68,43 +63,77 @@ async function apiPost(data) {
   return res.data;
 }
 
+// 🌟 HÀM LẤY DANH SÁCH DESIGNER ĐỘNG TỪ SHEET SETTINGS (CACHE 2 PHÚT)
+let cachedDesigners = [];
+let lastFetchTime = 0;
+
+async function getDynamicDesigners() {
+  const now = Date.now();
+  if (cachedDesigners.length > 0 && (now - lastFetchTime) < 120000) {
+    return cachedDesigners;
+  }
+  try {
+    const list = await apiGet("designers");
+    if (Array.isArray(list) && list.length > 0) {
+      cachedDesigners = list;
+      lastFetchTime = now;
+      console.log("🔄 Đã đồng bộ danh sách Designer mới từ SETTINGS:", list.map(d => d.name));
+    }
+  } catch (err) {
+    console.error("Lỗi lấy danh sách designers từ Sheet:", err.message);
+  }
+  return cachedDesigners;
+}
+
 function createTaskEmbed(task) {
   return new EmbedBuilder()
     .setTitle("📋 TASK MỚI")
     .addFields(
-      { name: "Request ID", value: String(task.requestId || "-") },
-      { name: "Người gửi", value: String(task.sender || "-") },
-      { name: "Team", value: String(task.team || "-") },
-      { name: "Thương hiệu", value: String(task.brand || "-") },
-      { name: "Phân loại", value: String(task.category || "-") },
-      { name: "Deadline", value: String(task.deadline || "-") },
-      { name: "Độ gấp", value: String(task.priority || "-") },
-      { name: "Kích thước", value: String(task.format || "-") },
-      { name: "Số lượng", value: String(task.quantity || "-") },
-      { name: "Brief", value: String(task.brief || "-").substring(0, 1000) },
+      { name: "Request ID",     value: String(task.requestId || "-") },
+      { name: "Người gửi",      value: String(task.sender || "-") },
+      { name: "Team",           value: String(task.team || "-") },
+      { name: "Thương hiệu",    value: String(task.brand || "-") },
+      { name: "Phân loại",      value: String(task.category || "-") },
+      { name: "Deadline",       value: String(task.deadline || "-") },
+      { name: "Độ gấp",         value: String(task.priority || "-") },
+      { name: "Kích thước",     value: String(task.format || "-") },
+      { name: "Số lượng",       value: String(task.quantity || "-") },
+      { name: "Brief",          value: String(task.brief || "-").substring(0, 1000) },
       { name: "File tham khảo", value: task.fileRef ? `[Mở File](${task.fileRef})` : "-" },
-      { name: "Trạng thái", value: String(task.status || "-") }
+      { name: "Trạng thái",     value: String(task.status || "-") }
     )
     .setColor("#5865F2");
 }
 
-function createAssignButtons() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("assign_HUYNH")
-      .setLabel("HUYNH")
-      .setStyle(ButtonStyle.Primary),
+// 🌟 TỰ ĐỘNG SINH NÚT BẤM DỰA TRÊN DANH SÁCH TỪ SHEET SETTINGS
+async function createAssignButtonsDynamic() {
+  const designers = await getDynamicDesigners();
+  const rows = [];
+  let currentRow = new ActionRowBuilder();
 
-    new ButtonBuilder()
-      .setCustomId("assign_NANCY")
-      .setLabel("NANCY")
-      .setStyle(ButtonStyle.Success),
+  // Danh sách màu nút luân phiên cho đẹp mắt
+  const styles = [ButtonStyle.Primary, ButtonStyle.Success, ButtonStyle.Secondary];
 
-    new ButtonBuilder()
-      .setCustomId("assign_NGỌC")
-      .setLabel("NGỌC")
-      .setStyle(ButtonStyle.Secondary)
-  );
+  designers.forEach((d, idx) => {
+    // Discord giới hạn 5 nút trên 1 hàng (Row)
+    if (currentRow.components.length >= 5) {
+      rows.push(currentRow);
+      currentRow = new ActionRowBuilder();
+    }
+
+    currentRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`assign_${d.name}`)
+        .setLabel(d.name)
+        .setStyle(styles[idx % styles.length])
+    );
+  });
+
+  if (currentRow.components.length > 0) {
+    rows.push(currentRow);
+  }
+
+  return rows;
 }
 
 function createStatusButtons(requestId) {
@@ -139,36 +168,28 @@ async function pollUnsyncedTasks() {
 
   try {
     const tasks = await apiGet("unsynced");
-
-    if (!Array.isArray(tasks)) {
-      console.log("⚠️ API không trả về mảng:", tasks);
-      return;
-    }
-
-    if (!tasks.length) return;
+    if (!Array.isArray(tasks) || !tasks.length) return;
 
     const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
 
     for (const task of tasks) {
       const reqId = String(task.requestId || "").trim();
-      if (!reqId) continue;
-
-      if (processingTaskIds.has(reqId)) {
-        console.log(`⏳ Bỏ qua task ${reqId} vì đang xử lý.`);
-        continue;
-      }
+      if (!reqId || processingTaskIds.has(reqId)) continue;
 
       processingTaskIds.add(reqId);
 
       try {
         console.log("📤 Đang gửi task lên Discord:", reqId);
 
+        // Sinh nút bấm Designer hoàn toàn tự động từ SETTINGS
+        const assignRows = await createAssignButtonsDynamic();
+
         const msg = await channel.send({
           embeds: [createTaskEmbed(task)],
-          components: [createAssignButtons()]
+          components: assignRows
         });
 
-        const saveRes = await apiPost({
+        await apiPost({
           action: "discordInfo",
           requestId: reqId,
           messageId: msg.id,
@@ -176,17 +197,12 @@ async function pollUnsyncedTasks() {
           messageUrl: msg.url
         });
 
-        console.log(`✅ Task ${reqId} đã sync:`, saveRes);
+        console.log(`✅ Task ${reqId} đã sync:`, msg.id);
 
-        setTimeout(() => {
-          processingTaskIds.delete(reqId);
-        }, 30000);
-
+        setTimeout(() => processingTaskIds.delete(reqId), 30000);
       } catch (sendErr) {
-        console.error(`❌ Lỗi gửi task ${reqId}:`, sendErr);
-        setTimeout(() => {
-          processingTaskIds.delete(reqId);
-        }, 15000);
+        console.error(`❌ Lỗi gửi task ${reqId}:`, sendErr.message);
+        setTimeout(() => processingTaskIds.delete(reqId), 15000);
       }
     }
   } catch (err) {
@@ -197,7 +213,7 @@ async function pollUnsyncedTasks() {
 }
 
 function startPolling() {
-  console.log("========== SAFE MONITOR STARTED ==========");
+  console.log("========== SAFE DYNAMIC MONITOR STARTED ==========");
   const runLoop = async () => {
     await pollUnsyncedTasks();
     setTimeout(runLoop, 15000);
@@ -215,64 +231,43 @@ client.on("interactionCreate", async (interaction) => {
   try {
     const customId = interaction.customId;
 
-    // ==================================================
-    // ASSIGN
-    // ==================================================
     if (customId.startsWith("assign_")) {
       const member = interaction.member;
 
-      // 1. Xác thực quyền Quản trị
+      await interaction.deferUpdate().catch(() => {});
+
       if (!member.roles.cache.has(MANAGER_ROLE_ID)) {
-        return interaction.reply({
+        return interaction.followUp({
           content: "❌ Bạn không có quyền assign task.",
           ephemeral: true
         });
       }
 
-      // 2. Phản hồi Discord lập tức để tránh lỗi hết hạn tương tác (3 giây)
-      await interaction.deferUpdate().catch(() => {});
-
-      // Chuẩn hóa tên Designer khử lỗi bảng mã tiếng Việt Unicode
-      const designerRaw = customId.replace("assign_", "");
-      const designer = String(designerRaw).trim().normalize("NFC");
-
+      const designer = customId.replace("assign_", "").trim().normalize("NFC");
       const embed = interaction.message.embeds[0];
       const requestId = embed.fields[0].value;
 
       console.log("ASSIGN REQUEST:", { requestId, designer });
 
-      // 3. Ghi nhận Designer lên Google Sheet
-      const result = await apiPost({
+      await apiPost({
         action: "assign",
         requestId,
         designer
       });
 
-      console.log("Assign Result:", result);
-
-      // 4. Cập nhật nút bấm thành trạng thái đã giao việc
       await interaction.editReply({
         content: `✅ Đã assign cho **${designer}**`,
         components: []
       }).catch(console.error);
 
-      // 5. Luồng gửi thông báo vào kênh cá nhân Designer (bọc riêng để tránh treo bot)
+      // 🌟 TÌM KÊNH CỦA DESIGNER ĐỘNG TỪ BẢNG SETTINGS
       try {
-        const designerChannelMap = {
-          "HUYNH": "1511559274625765480",
-          "NANCY": "1511559338043641916",
-          "NGỌC": "1511559317298352288"
-        };
+        const currentDesigners = await getDynamicDesigners();
+        const found = currentDesigners.find(d => d.name.toUpperCase() === designer.toUpperCase());
 
-        const targetChannelId = designerChannelMap[designer] || designerChannelMap[designer.toUpperCase()];
-
-        if (targetChannelId) {
-          const task = await apiPost({
-            action: "task",
-            requestId
-          });
-
-          const targetChannel = await client.channels.fetch(targetChannelId);
+        if (found && found.channelId) {
+          const task = await apiPost({ action: "task", requestId });
+          const targetChannel = await client.channels.fetch(found.channelId);
           if (targetChannel) {
             await targetChannel.send({
               content: `🎨 Task mới cho ${designer}`,
@@ -281,18 +276,15 @@ client.on("interactionCreate", async (interaction) => {
             });
           }
         } else {
-          console.log(`⚠️ Không tìm thấy channel map cho Designer: ${designer}`);
+          console.log(`⚠️ Designer ${designer} chưa được cấu hình Channel ID tại Sheet SETTINGS.`);
         }
       } catch (notifyErr) {
-        console.error("⚠️ Lỗi gửi tin sang kênh riêng Designer:", notifyErr.message);
+        console.error("⚠️ Lỗi gửi tin sang kênh Designer:", notifyErr.message);
       }
 
       return;
     }
 
-    // ==================================================
-    // STATUS
-    // ==================================================
     if (customId.startsWith("status_")) {
       const parts = customId.split("_");
       const status = parts[1];
@@ -308,26 +300,18 @@ client.on("interactionCreate", async (interaction) => {
         try {
           const reviewChannel = await client.channels.fetch(CHANNEL_REVIEW);
           if (reviewChannel) {
-            await reviewChannel.send({
-              content: `👀 Task cần review: ${requestId}`
-            });
+            await reviewChannel.send({ content: `👀 Task cần review: ${requestId}` });
           }
-        } catch (e) {
-          console.error("Lỗi gửi kênh Review:", e.message);
-        }
+        } catch (e) {}
       }
 
       if (status === "Done") {
         try {
           const doneChannel = await client.channels.fetch(CHANNEL_DONE);
           if (doneChannel) {
-            await doneChannel.send({
-              content: `✅ Task hoàn thành: ${requestId}`
-            });
+            await doneChannel.send({ content: `✅ Task hoàn thành: ${requestId}` });
           }
-        } catch (e) {
-          console.error("Lỗi gửi kênh Done:", e.message);
-        }
+        } catch (e) {}
       }
 
       await interaction.reply({
