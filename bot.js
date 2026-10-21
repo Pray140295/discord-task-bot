@@ -15,11 +15,15 @@ const axios = require("axios");
 const app = express();
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
 // ======================================================
-// CONFIG
+// CONFIG MÔI TRƯỜNG
 // ======================================================
 
 const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL;
@@ -29,7 +33,7 @@ const CHANNEL_REVIEW    = process.env.CHANNEL_REVIEW;
 const CHANNEL_DONE      = process.env.CHANNEL_DONE;
 
 // ======================================================
-// KEEP ALIVE
+// KEEP ALIVE WEB SERVER (CHO RENDER / UPTIME KUMA)
 // ======================================================
 
 app.get("/", (req, res) => res.send("Bot Online"));
@@ -40,16 +44,21 @@ app.listen(process.env.PORT || 3000, () => {
 });
 
 // ======================================================
-// READY
+// READY & KHỞI ĐỘNG HỆ THỐNG
 // ======================================================
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Tự động quét và dọn sạch các tin nhắn task trùng lặp lúc khởi động
+  await cleanupDuplicateTaskMessages();
+
+  // Khởi chạy vòng lặp kiểm tra task mới an toàn
   startPolling();
 });
 
 // ======================================================
-// HELPERS
+// API HELPERS
 // ======================================================
 
 async function apiGet(action) {
@@ -63,12 +72,16 @@ async function apiPost(data) {
   return res.data;
 }
 
-// 🌟 HÀM LẤY DANH SÁCH DESIGNER ĐỘNG TỪ SHEET SETTINGS (CACHE 2 PHÚT)
+// ======================================================
+// ĐỒNG BỘ DESIGNER & CHANNEL ID ĐỘNG TỪ SHEET SETTINGS
+// ======================================================
+
 let cachedDesigners = [];
 let lastFetchTime = 0;
 
 async function getDynamicDesigners() {
   const now = Date.now();
+  // Giữ cache trong 2 phút (120000ms) để tối ưu tốc độ và không spam Sheet
   if (cachedDesigners.length > 0 && (now - lastFetchTime) < 120000) {
     return cachedDesigners;
   }
@@ -77,13 +90,17 @@ async function getDynamicDesigners() {
     if (Array.isArray(list) && list.length > 0) {
       cachedDesigners = list;
       lastFetchTime = now;
-      console.log("🔄 Đã đồng bộ danh sách Designer mới từ SETTINGS:", list.map(d => d.name));
+      console.log("🔄 Đã đồng bộ danh sách Designer từ SETTINGS:", list.map(d => d.name));
     }
   } catch (err) {
     console.error("Lỗi lấy danh sách designers từ Sheet:", err.message);
   }
   return cachedDesigners;
 }
+
+// ======================================================
+// EMBED & BUTTON BUILDERS
+// ======================================================
 
 function createTaskEmbed(task) {
   return new EmbedBuilder()
@@ -105,17 +122,15 @@ function createTaskEmbed(task) {
     .setColor("#5865F2");
 }
 
-// 🌟 TỰ ĐỘNG SINH NÚT BẤM DỰA TRÊN DANH SÁCH TỪ SHEET SETTINGS
 async function createAssignButtonsDynamic() {
   const designers = await getDynamicDesigners();
   const rows = [];
   let currentRow = new ActionRowBuilder();
 
-  // Danh sách màu nút luân phiên cho đẹp mắt
   const styles = [ButtonStyle.Primary, ButtonStyle.Success, ButtonStyle.Secondary];
 
   designers.forEach((d, idx) => {
-    // Discord giới hạn 5 nút trên 1 hàng (Row)
+    // Discord giới hạn tối đa 5 nút trên 1 hàng (Row)
     if (currentRow.components.length >= 5) {
       rows.push(currentRow);
       currentRow = new ActionRowBuilder();
@@ -156,7 +171,51 @@ function createStatusButtons(requestId) {
 }
 
 // ======================================================
-// MONITOR TASKS
+// QUÉT VÀ DỌN DẸP TIN NHẮN TRÙNG LẶP TRONG KÊNH TASK MỚI
+// ======================================================
+
+async function cleanupDuplicateTaskMessages() {
+  try {
+    const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
+    if (!channel) return;
+
+    console.log("🧹 Bắt đầu quét tin nhắn trùng lặp trong kênh Task mới...");
+    const messages = await channel.messages.fetch({ limit: 100 });
+
+    const seenTaskIds = new Set();
+    const messagesToDelete = [];
+
+    messages.forEach((msg) => {
+      if (msg.author.id === client.user.id && msg.embeds.length > 0) {
+        const embed = msg.embeds[0];
+        const reqIdField = embed.fields.find(f => f.name === "Request ID");
+        if (reqIdField && reqIdField.value && reqIdField.value !== "-") {
+          const reqId = reqIdField.value.trim();
+
+          if (seenTaskIds.has(reqId)) {
+            messagesToDelete.push(msg);
+          } else {
+            seenTaskIds.add(reqId);
+          }
+        }
+      }
+    });
+
+    console.log(`🧹 Tìm thấy ${messagesToDelete.length} tin nhắn trùng lặp.`);
+
+    for (const msg of messagesToDelete) {
+      await msg.delete().catch(() => {});
+      await new Promise(r => setTimeout(r, 1000)); // Tránh giới hạn tốc độ của Discord
+    }
+
+    console.log("✅ Dọn dẹp tin nhắn trùng lặp hoàn tất!");
+  } catch (err) {
+    console.error("❌ Lỗi dọn dẹp tin nhắn:", err.message);
+  }
+}
+
+// ======================================================
+// SAFE POLLING (CHỐNG SPAM & KHÓA LUỒNG TUYỆT ĐỐI)
 // ======================================================
 
 let isPolling = false;
@@ -181,7 +240,6 @@ async function pollUnsyncedTasks() {
       try {
         console.log("📤 Đang gửi task lên Discord:", reqId);
 
-        // Sinh nút bấm Designer hoàn toàn tự động từ SETTINGS
         const assignRows = await createAssignButtonsDynamic();
 
         const msg = await channel.send({
@@ -197,7 +255,7 @@ async function pollUnsyncedTasks() {
           messageUrl: msg.url
         });
 
-        console.log(`✅ Task ${reqId} đã sync:`, msg.id);
+        console.log(`✅ Task ${reqId} đã sync thành công:`, msg.id);
 
         setTimeout(() => processingTaskIds.delete(reqId), 30000);
       } catch (sendErr) {
@@ -222,18 +280,34 @@ function startPolling() {
 }
 
 // ======================================================
-// INTERACTION
+// XỬ LÝ LỆNH CHAT VÀ NÚT BẤM (INTERACTIONS)
 // ======================================================
 
+// 1. Lệnh chat thủ công xóa tin trùng: !cleandup
+client.on("messageCreate", async (message) => {
+  if (message.author.bot || message.content !== "!cleandup") return;
+
+  if (!message.member.roles.cache.has(MANAGER_ROLE_ID)) {
+    return message.reply("❌ Bạn không có quyền sử dụng lệnh này.");
+  }
+
+  const statusMsg = await message.reply("⏳ Đang quét và dọn dẹp tin nhắn trùng lặp...");
+  await cleanupDuplicateTaskMessages();
+  await statusMsg.edit("✅ Đã dọn dẹp xong toàn bộ tin nhắn trùng lặp trong kênh!");
+});
+
+// 2. Sự kiện nhấn nút
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
 
   try {
     const customId = interaction.customId;
 
+    // --- NÚT GÁN DESIGNER ---
     if (customId.startsWith("assign_")) {
       const member = interaction.member;
 
+      // Phản hồi Discord tức thì để tránh timeout 3s
       await interaction.deferUpdate().catch(() => {});
 
       if (!member.roles.cache.has(MANAGER_ROLE_ID)) {
@@ -260,7 +334,7 @@ client.on("interactionCreate", async (interaction) => {
         components: []
       }).catch(console.error);
 
-      // 🌟 TÌM KÊNH CỦA DESIGNER ĐỘNG TỪ BẢNG SETTINGS
+      // Gửi thông báo đến kênh cá nhân Designer
       try {
         const currentDesigners = await getDynamicDesigners();
         const found = currentDesigners.find(d => d.name.toUpperCase() === designer.toUpperCase());
@@ -276,7 +350,7 @@ client.on("interactionCreate", async (interaction) => {
             });
           }
         } else {
-          console.log(`⚠️ Designer ${designer} chưa được cấu hình Channel ID tại Sheet SETTINGS.`);
+          console.log(`⚠️ Designer ${designer} chưa có Channel ID tại sheet SETTINGS.`);
         }
       } catch (notifyErr) {
         console.error("⚠️ Lỗi gửi tin sang kênh Designer:", notifyErr.message);
@@ -285,6 +359,7 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // --- NÚT CẬP NHẬT TRẠNG THÁI ---
     if (customId.startsWith("status_")) {
       const parts = customId.split("_");
       const status = parts[1];
@@ -334,58 +409,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ======================================================
-// HÀM DỌN DẸP TIN NHẮN TRÙNG LẶP TRONG KÊNH TASK MỚI
-// ======================================================
-async function cleanupDuplicateTaskMessages() {
-  try {
-    const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
-    if (!channel) return;
-
-    console.log("🧹 Bắt đầu quét tin nhắn trùng lặp...");
-    // Lấy 100 tin nhắn gần nhất trong kênh
-    const messages = await channel.messages.fetch({ limit: 100 });
-
-    const seenTaskIds = new Set();
-    const messagesToDelete = [];
-
-    // Duyệt qua từng tin nhắn từ mới nhất đến cũ hơn
-    messages.forEach((msg) => {
-      // Chỉ kiểm tra tin nhắn do chính bot gửi và có embed
-      if (msg.author.id === client.user.id && msg.embeds.length > 0) {
-        const embed = msg.embeds[0];
-        // Tìm trường Request ID trong Embed
-        const reqIdField = embed.fields.find(f => f.name === "Request ID");
-        if (reqIdField && reqIdField.value && reqIdField.value !== "-") {
-          const reqId = reqIdField.value.trim();
-
-          if (seenTaskIds.has(reqId)) {
-            // Đã thấy task này trước đó -> Đánh dấu tin này là trùng lặp để xóa
-            messagesToDelete.push(msg);
-          } else {
-            // Lần đầu thấy task này -> Giữ lại
-            seenTaskIds.add(reqId);
-          }
-        }
-      }
-    });
-
-    console.log(`🧹 Tìm thấy ${messagesToDelete.length} tin nhắn trùng lặp cần xóa.`);
-
-    // Thực hiện xóa các tin nhắn trùng lặp
-    for (const msg of messagesToDelete) {
-      await msg.delete().catch(() => {});
-      // Nghỉ 1 giây giữa các lần xóa để tránh bị Discord rate-limit
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    console.log("✅ Đã dọn dẹp xong tin nhắn trùng lặp!");
-  } catch (err) {
-    console.error("❌ Lỗi dọn dẹp tin nhắn:", err.message);
-  }
-}
-
-// ======================================================
-// LOGIN
+// LOGIN DISCORD CLIENT
 // ======================================================
 
 client.login(process.env.DISCORD_TOKEN);
