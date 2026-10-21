@@ -334,6 +334,57 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ======================================================
+// HÀM DỌN DẸP TIN NHẮN TRÙNG LẶP TRONG KÊNH TASK MỚI
+// ======================================================
+async function cleanupDuplicateTaskMessages() {
+  try {
+    const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
+    if (!channel) return;
+
+    console.log("🧹 Bắt đầu quét tin nhắn trùng lặp...");
+    // Lấy 100 tin nhắn gần nhất trong kênh
+    const messages = await channel.messages.fetch({ limit: 100 });
+
+    const seenTaskIds = new Set();
+    const messagesToDelete = [];
+
+    // Duyệt qua từng tin nhắn từ mới nhất đến cũ hơn
+    messages.forEach((msg) => {
+      // Chỉ kiểm tra tin nhắn do chính bot gửi và có embed
+      if (msg.author.id === client.user.id && msg.embeds.length > 0) {
+        const embed = msg.embeds[0];
+        // Tìm trường Request ID trong Embed
+        const reqIdField = embed.fields.find(f => f.name === "Request ID");
+        if (reqIdField && reqIdField.value && reqIdField.value !== "-") {
+          const reqId = reqIdField.value.trim();
+
+          if (seenTaskIds.has(reqId)) {
+            // Đã thấy task này trước đó -> Đánh dấu tin này là trùng lặp để xóa
+            messagesToDelete.push(msg);
+          } else {
+            // Lần đầu thấy task này -> Giữ lại
+            seenTaskIds.add(reqId);
+          }
+        }
+      }
+    });
+
+    console.log(`🧹 Tìm thấy ${messagesToDelete.length} tin nhắn trùng lặp cần xóa.`);
+
+    // Thực hiện xóa các tin nhắn trùng lặp
+    for (const msg of messagesToDelete) {
+      await msg.delete().catch(() => {});
+      // Nghỉ 1 giây giữa các lần xóa để tránh bị Discord rate-limit
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    console.log("✅ Đã dọn dẹp xong tin nhắn trùng lặp!");
+  } catch (err) {
+    console.error("❌ Lỗi dọn dẹp tin nhắn:", err.message);
+  }
+}
+
+// ======================================================
 // LOGIN
 // ======================================================
 
