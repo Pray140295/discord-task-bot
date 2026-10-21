@@ -1,415 +1,313 @@
-require("dotenv").config();
+/**
+ * THISKYHALL Discord Bot v3.0 (discord.js v14)
+ * Requires: npm install discord.js axios express dotenv
+ * Required environment: DISCORD_TOKEN, GOOGLE_SCRIPT_URL, GOOGLE_SCRIPT_TOKEN,
+ * MANAGER_ROLE_ID, CHANNEL_TASK_NEW, CHANNEL_REVIEW, CHANNEL_DONE.
+ * SETTINGS column E = designer channel ID; column C = designer Discord user ID.
+ */
+require('dotenv').config();
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+const express = require('express');
+const axios = require('axios');
 
-const {
-  Client,
-  GatewayIntentBits,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder
-} = require("discord.js");
+const ENV_KEYS = ['DISCORD_TOKEN','GOOGLE_SCRIPT_URL','GOOGLE_SCRIPT_TOKEN','MANAGER_ROLE_ID','CHANNEL_TASK_NEW','CHANNEL_REVIEW','CHANNEL_DONE'];
+const missing = ENV_KEYS.filter(k => !process.env[k]);
+if (missing.length) throw new Error(`Missing .env variables: ${missing.join(', ')}`);
+if (process.env.GOOGLE_SCRIPT_TOKEN.length < 32) throw new Error('GOOGLE_SCRIPT_TOKEN must contain at least 32 characters');
 
-const express = require("express");
-const axios = require("axios");
-
+const cfg = {
+  url: process.env.GOOGLE_SCRIPT_URL, token: process.env.GOOGLE_SCRIPT_TOKEN,
+  managerRoleId: process.env.MANAGER_ROLE_ID,
+  newChannel: process.env.CHANNEL_TASK_NEW,
+  reviewChannel: process.env.CHANNEL_REVIEW,
+  doneChannel: process.env.CHANNEL_DONE
+};
+const client = new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent]});
 const app = express();
+app.get('/', (_req,res) => res.send('Bot Online'));
+app.get('/ping', (_req,res) => res.status(client.isReady()?200:503).send(client.isReady()?'pong':'Discord not connected'));
+app.listen(Number(process.env.PORT) || 3000, () => console.log('Health server ready'));
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-});
-
-// ======================================================
-// CONFIG MÔI TRƯỜNG
-// ======================================================
-
-const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL;
-const MANAGER_ROLE_ID   = process.env.MANAGER_ROLE_ID;
-const CHANNEL_TASK_NEW  = process.env.CHANNEL_TASK_NEW;
-const CHANNEL_REVIEW    = process.env.CHANNEL_REVIEW;
-const CHANNEL_DONE      = process.env.CHANNEL_DONE;
-
-// ======================================================
-// KEEP ALIVE WEB SERVER (CHO RENDER / UPTIME KUMA)
-// ======================================================
-
-app.get("/", (req, res) => res.send("Bot Online"));
-app.get("/ping", (req, res) => res.send("pong"));
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Web Server Running");
-});
-
-// ======================================================
-// READY & KHỞI ĐỘNG HỆ THỐNG
-// ======================================================
-
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-
-  // Tự động quét và dọn sạch các tin nhắn task trùng lặp lúc khởi động
-  await cleanupDuplicateTaskMessages();
-
-  // Khởi chạy vòng lặp kiểm tra task mới an toàn
-  startPolling();
-});
-
-// ======================================================
-// API HELPERS
-// ======================================================
-
-async function apiGet(action) {
-  const url = `${GOOGLE_SCRIPT_URL}?action=${action}`;
-  const res = await axios.get(url, { timeout: 30000 });
-  return res.data;
+function apiProblem(action, data) {
+  let msg = data?.message || data?.code || 'API returned an invalid response';
+  throw new Error(`${action}: ${msg}`);
 }
-
-async function apiPost(data) {
-  const res = await axios.post(GOOGLE_SCRIPT_URL, data, { timeout: 30000 });
-  return res.data;
-}
-
-// ======================================================
-// ĐỒNG BỘ DESIGNER & CHANNEL ID ĐỘNG TỪ SHEET SETTINGS
-// ======================================================
-
-let cachedDesigners = [];
-let lastFetchTime = 0;
-
-async function getDynamicDesigners() {
-  const now = Date.now();
-  // Giữ cache trong 2 phút (120000ms) để tối ưu tốc độ và không spam Sheet
-  if (cachedDesigners.length > 0 && (now - lastFetchTime) < 120000) {
-    return cachedDesigners;
-  }
-  try {
-    const list = await apiGet("designers");
-    if (Array.isArray(list) && list.length > 0) {
-      cachedDesigners = list;
-      lastFetchTime = now;
-      console.log("🔄 Đã đồng bộ danh sách Designer từ SETTINGS:", list.map(d => d.name));
-    }
-  } catch (err) {
-    console.error("Lỗi lấy danh sách designers từ Sheet:", err.message);
-  }
-  return cachedDesigners;
-}
-
-// ======================================================
-// EMBED & BUTTON BUILDERS
-// ======================================================
-
-function createTaskEmbed(task) {
-  return new EmbedBuilder()
-    .setTitle("📋 TASK MỚI")
-    .addFields(
-      { name: "Request ID",     value: String(task.requestId || "-") },
-      { name: "Người gửi",      value: String(task.sender || "-") },
-      { name: "Team",           value: String(task.team || "-") },
-      { name: "Thương hiệu",    value: String(task.brand || "-") },
-      { name: "Phân loại",      value: String(task.category || "-") },
-      { name: "Deadline",       value: String(task.deadline || "-") },
-      { name: "Độ gấp",         value: String(task.priority || "-") },
-      { name: "Kích thước",     value: String(task.format || "-") },
-      { name: "Số lượng",       value: String(task.quantity || "-") },
-      { name: "Brief",          value: String(task.brief || "-").substring(0, 1000) },
-      { name: "File tham khảo", value: task.fileRef ? `[Mở File](${task.fileRef})` : "-" },
-      { name: "Trạng thái",     value: String(task.status || "-") }
-    )
-    .setColor("#5865F2");
-}
-
-async function createAssignButtonsDynamic() {
-  const designers = await getDynamicDesigners();
-  const rows = [];
-  let currentRow = new ActionRowBuilder();
-
-  const styles = [ButtonStyle.Primary, ButtonStyle.Success, ButtonStyle.Secondary];
-
-  designers.forEach((d, idx) => {
-    // Discord giới hạn tối đa 5 nút trên 1 hàng (Row)
-    if (currentRow.components.length >= 5) {
-      rows.push(currentRow);
-      currentRow = new ActionRowBuilder();
-    }
-
-    currentRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`assign_${d.name}`)
-        .setLabel(d.name)
-        .setStyle(styles[idx % styles.length])
-    );
+async function api(action, data = {}) {
+  const res = await axios.post(cfg.url, { ...data, action, apiToken: cfg.token }, {
+    timeout: 30000, maxRedirects: 5, headers:{'Content-Type':'application/json'}
   });
-
-  if (currentRow.components.length > 0) {
-    rows.push(currentRow);
-  }
-
-  return rows;
+  if (typeof res.data !== 'object' || res.data === null || typeof res.data === 'string') apiProblem(action, res.data);
+  if (res.data.success === false) apiProblem(action, res.data);
+  return res.data;
 }
-
-function createStatusButtons(requestId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`status_In Progress_${requestId}`)
-      .setLabel("Đang Làm")
-      .setStyle(ButtonStyle.Primary),
-
-    new ButtonBuilder()
-      .setCustomId(`status_Review_${requestId}`)
-      .setLabel("Chờ Review")
-      .setStyle(ButtonStyle.Success),
-
-    new ButtonBuilder()
-      .setCustomId(`status_Done_${requestId}`)
-      .setLabel("Done")
-      .setStyle(ButtonStyle.Danger)
+let designerCache = [], designerCacheAt = 0;
+async function getDesigners(force=false) {
+  if (!force && designerCache.length && Date.now()-designerCacheAt < 120000) return designerCache;
+  try {
+    const list = await api('designers');
+    if (!Array.isArray(list)) throw new Error('Designer list is not an array');
+    designerCache = list.filter(d => d && typeof d.name === 'string' && d.name.trim());
+    designerCacheAt = Date.now();
+  } catch (err) {
+    console.error('Designer fetch failed:', err.message);
+    if (!designerCache.length) throw err;
+  }
+  return designerCache;
+}
+const idOf = x => String(x || '').trim();
+const short = (x,limit=200) => {
+  const value = String(x === null || x === undefined || x === '' ? '-' : x);
+  return value.length > limit ? value.slice(0,limit-1)+'…' : value;
+};
+function createTaskEmbed(task, title='📋 TASK') {
+  let url = String(task.fileRef || '').trim();
+  let file = /^https?:\/\/\S+$/i.test(url) && url.length <= 850 ? `[Mở File](${url.replace(/[)\\]/g, '')})` : short(url || '-', 850);
+  return new EmbedBuilder().setTitle(title).setColor('#5865F2').addFields(
+    {name:'Request ID',value:short(task.requestId)},
+    {name:'Người gửi',value:short(task.sender)},
+    {name:'Team',value:short(task.team)},
+    {name:'Thương hiệu',value:short(task.brand)},
+    {name:'Phân loại',value:short(task.category)},
+    {name:'Deadline',value:short(task.deadline)},
+    {name:'Độ gấp',value:short(task.priority)},
+    {name:'Kích thước',value:short(task.format)},
+    {name:'Số lượng',value:short(task.quantity)},
+    {name:'Brief',value:short(task.brief,850)},
+    {name:'File tham khảo',value:file},
+    {name:'Designer',value:short(task.designer)},
+    {name:'Trạng thái',value:short(task.status)},
+    {name:'Round',value:short(task.round)}
   );
 }
-
-// ======================================================
-// QUÉT VÀ DỌN DẸP TIN NHẮN TRÙNG LẶP TRONG KÊNH TASK MỚI
-// ======================================================
-
-async function cleanupDuplicateTaskMessages() {
-  try {
-    const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
-    if (!channel) return;
-
-    console.log("🧹 Bắt đầu quét tin nhắn trùng lặp trong kênh Task mới...");
-    const messages = await channel.messages.fetch({ limit: 100 });
-
-    const seenTaskIds = new Set();
-    const messagesToDelete = [];
-
-    messages.forEach((msg) => {
-      if (msg.author.id === client.user.id && msg.embeds.length > 0) {
-        const embed = msg.embeds[0];
-        const reqIdField = embed.fields.find(f => f.name === "Request ID");
-        if (reqIdField && reqIdField.value && reqIdField.value !== "-") {
-          const reqId = reqIdField.value.trim();
-
-          if (seenTaskIds.has(reqId)) {
-            messagesToDelete.push(msg);
-          } else {
-            seenTaskIds.add(reqId);
-          }
-        }
-      }
-    });
-
-    console.log(`🧹 Tìm thấy ${messagesToDelete.length} tin nhắn trùng lặp.`);
-
-    for (const msg of messagesToDelete) {
-      await msg.delete().catch(() => {});
-      await new Promise(r => setTimeout(r, 1000)); // Tránh giới hạn tốc độ của Discord
-    }
-
-    console.log("✅ Dọn dẹp tin nhắn trùng lặp hoàn tất!");
-  } catch (err) {
-    console.error("❌ Lỗi dọn dẹp tin nhắn:", err.message);
-  }
+function assignRows(designers) {
+  if (!designers.length) throw new Error('No designers in SETTINGS; refuse to send unassignable task');
+  if (designers.length > 25) throw new Error('Discord supports at most 25 buttons; reduce designer list/use select menu');
+  const rows=[];
+  designers.forEach((d,index) => {
+    if (!d.name || d.name.length > 80 || `assign_${d.name}`.length > 100) throw new Error('Designer name exceeds Discord button limits');
+    if (index % 5 === 0) rows.push(new ActionRowBuilder());
+    rows[rows.length-1].addComponents(new ButtonBuilder()
+      .setCustomId(`assign_${d.name}`).setLabel(d.name).setStyle(ButtonStyle.Primary));
+  });
+  return rows;
 }
-
-// ======================================================
-// SAFE POLLING (CHỐNG SPAM & KHÓA LUỒNG TUYỆT ĐỐI)
-// ======================================================
-
-let isPolling = false;
-const processingTaskIds = new Set();
-
-async function pollUnsyncedTasks() {
-  if (isPolling) return;
-  isPolling = true;
-
+const STATUS_CODES = {doing:'Doing',review:'Review',revision:'Revision',done:'Done'};
+function statusRows(reqId) {
+  const buttons = [
+    ['doing','Đang làm',ButtonStyle.Primary],
+    ['review','Chờ Review',ButtonStyle.Success],
+    ['revision','Yêu cầu sửa',ButtonStyle.Secondary],
+    ['done','Duyệt Done',ButtonStyle.Danger]
+  ];
+  const row = new ActionRowBuilder();
+  for (const [code,label,style] of buttons) {
+    const customId = `status:${code}:${reqId}`;
+    if (customId.length > 100) throw new Error('Request ID too long for Discord button');
+    row.addComponents(new ButtonBuilder().setCustomId(customId).setLabel(label).setStyle(style));
+  }
+  return [row];
+}
+function embeddedRequestId(msg) {
+  const field = msg.embeds?.[0]?.fields?.find(f => f.name === 'Request ID');
+  return idOf(field?.value);
+}
+async function scanRecentTasks(channel, limit=300) {
+  const found = new Map(), duplicate=[];
+  let before;
+  for (let read=0;read<limit;read+=100) {
+    const batch=await channel.messages.fetch({...{limit:Math.min(100,limit-read)}, ...(before?{before}:{})});
+    if (!batch.size) break;
+    for (const msg of batch.values()) {
+      if (msg.author.id !== client.user.id) continue;
+      const id=embeddedRequestId(msg);
+      if (!id) continue;
+      if (found.has(id)) duplicate.push(msg);
+      else found.set(id,msg);
+    }
+    before=batch.last()?.id;
+    if (batch.size < Math.min(100,limit-read)) break;
+  }
+  return {found,duplicate};
+}
+async function duplicateReport() {
+  const channel=await client.channels.fetch(cfg.newChannel);
+  if (!channel || !channel.messages) throw new Error('New task channel is not a text channel');
+  const {duplicate}=await scanRecentTasks(channel);
+  console.log(`Duplicate audit: ${duplicate.length} duplicates among latest 300 messages. No automatic deletion.`);
+  return duplicate.length;
+}
+const processing = new Set();
+let polling = false;
+const warnings = new Set();
+async function poll() {
+  if (polling) return;
+  polling=true;
   try {
-    const tasks = await apiGet("unsynced");
-    if (!Array.isArray(tasks) || !tasks.length) return;
-
-    const channel = await client.channels.fetch(CHANNEL_TASK_NEW);
-
+    const tasks=await api('unsynced');
+    if (!Array.isArray(tasks)) throw new Error('unsynced returned non-array');
+    if (!tasks.length) return;
+    const channel=await client.channels.fetch(cfg.newChannel);
+    if (!channel || typeof channel.send !== 'function' || !channel.messages) throw new Error('Configured task channel cannot send/fetch messages');
+    let scan = await scanRecentTasks(channel,300);
     for (const task of tasks) {
-      const reqId = String(task.requestId || "").trim();
-      if (!reqId || processingTaskIds.has(reqId)) continue;
-
-      processingTaskIds.add(reqId);
-
+      const reqId=idOf(task.requestId);
+      if (!reqId || processing.has(reqId)) continue;
+      processing.add(reqId);
       try {
-        console.log("📤 Đang gửi task lên Discord:", reqId);
-
-        const assignRows = await createAssignButtonsDynamic();
-
-        const msg = await channel.send({
-          embeds: [createTaskEmbed(task)],
-          components: assignRows
-        });
-
-        await apiPost({
-          action: "discordInfo",
-          requestId: reqId,
-          messageId: msg.id,
-          channelId: channel.id,
-          messageUrl: msg.url
-        });
-
-        console.log(`✅ Task ${reqId} đã sync thành công:`, msg.id);
-
-        setTimeout(() => processingTaskIds.delete(reqId), 30000);
-      } catch (sendErr) {
-        console.error(`❌ Lỗi gửi task ${reqId}:`, sendErr.message);
-        setTimeout(() => processingTaskIds.delete(reqId), 15000);
-      }
-    }
-  } catch (err) {
-    console.error("❌ MONITOR ERROR:", err.message);
-  } finally {
-    isPolling = false;
-  }
-}
-
-function startPolling() {
-  console.log("========== SAFE DYNAMIC MONITOR STARTED ==========");
-  const runLoop = async () => {
-    await pollUnsyncedTasks();
-    setTimeout(runLoop, 15000);
-  };
-  runLoop();
-}
-
-// ======================================================
-// XỬ LÝ LỆNH CHAT VÀ NÚT BẤM (INTERACTIONS)
-// ======================================================
-
-// 1. Lệnh chat thủ công xóa tin trùng: !cleandup
-client.on("messageCreate", async (message) => {
-  if (message.author.bot || message.content !== "!cleandup") return;
-
-  if (!message.member.roles.cache.has(MANAGER_ROLE_ID)) {
-    return message.reply("❌ Bạn không có quyền sử dụng lệnh này.");
-  }
-
-  const statusMsg = await message.reply("⏳ Đang quét và dọn dẹp tin nhắn trùng lặp...");
-  await cleanupDuplicateTaskMessages();
-  await statusMsg.edit("✅ Đã dọn dẹp xong toàn bộ tin nhắn trùng lặp trong kênh!");
-});
-
-// 2. Sự kiện nhấn nút
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isButton()) return;
-
-  try {
-    const customId = interaction.customId;
-
-    // --- NÚT GÁN DESIGNER ---
-    if (customId.startsWith("assign_")) {
-      const member = interaction.member;
-
-      // Phản hồi Discord tức thì để tránh timeout 3s
-      await interaction.deferUpdate().catch(() => {});
-
-      if (!member.roles.cache.has(MANAGER_ROLE_ID)) {
-        return interaction.followUp({
-          content: "❌ Bạn không có quyền assign task.",
-          ephemeral: true
-        });
-      }
-
-      const designer = customId.replace("assign_", "").trim().normalize("NFC");
-      const embed = interaction.message.embeds[0];
-      const requestId = embed.fields[0].value;
-
-      console.log("ASSIGN REQUEST:", { requestId, designer });
-
-      await apiPost({
-        action: "assign",
-        requestId,
-        designer
-      });
-
-      await interaction.editReply({
-        content: `✅ Đã assign cho **${designer}**`,
-        components: []
-      }).catch(console.error);
-
-      // Gửi thông báo đến kênh cá nhân Designer
-      try {
-        const currentDesigners = await getDynamicDesigners();
-        const found = currentDesigners.find(d => d.name.toUpperCase() === designer.toUpperCase());
-
-        if (found && found.channelId) {
-          const task = await apiPost({ action: "task", requestId });
-          const targetChannel = await client.channels.fetch(found.channelId);
-          if (targetChannel) {
-            await targetChannel.send({
-              content: `🎨 Task mới cho ${designer}`,
-              embeds: [createTaskEmbed(task)],
-              components: [createStatusButtons(requestId)]
-            });
-          }
-        } else {
-          console.log(`⚠️ Designer ${designer} chưa có Channel ID tại sheet SETTINGS.`);
+        // Old sends and uncertain POSTING sends: reconcile rather than sending a duplicate.
+        let existing=scan.found.get(reqId);
+        if (task.messageId && !existing) {
+          try { existing=await channel.messages.fetch(String(task.messageId)); } catch (_) {}
         }
-      } catch (notifyErr) {
-        console.error("⚠️ Lỗi gửi tin sang kênh Designer:", notifyErr.message);
-      }
-
-      return;
+        if (existing) {
+          await api('discordInfo',{requestId:reqId,messageId:existing.id,channelId:existing.channel.id,messageUrl:existing.url});
+          continue;
+        }
+        const state=String(task.syncStatus || '').toUpperCase();
+        if (state === 'POSTING' || state === 'RECONCILE_REQUIRED' || task.messageId) {
+          if (!warnings.has(reqId)) console.error(`RECONCILE MANUALLY: ${reqId} in state ${state || 'HAS_MESSAGE_ID'}; not automatically reposting`);
+          warnings.add(reqId);
+          continue;
+        }
+        const designers=await getDesigners();
+        const rows=assignRows(designers);
+        const claim=await api('claimSync',{requestId:reqId});
+        if (!claim.claimed) continue;
+        // If send fails after claim, leave POSTING and reconcile rather than blindly retry.
+        const msg=await channel.send({embeds:[createTaskEmbed(task,'📋 TASK MỚI')],components:rows,allowedMentions:{parse:[]}});
+        scan.found.set(reqId,msg);
+        await api('discordInfo',{requestId:reqId,messageId:msg.id,channelId:channel.id,messageUrl:msg.url});
+        console.log('SYNCED:',reqId,msg.id);
+      } catch(err) { console.error('SYNC ERROR:',reqId,err.message); }
+      finally { processing.delete(reqId); }
     }
+  } catch(err) { console.error('POLL ERROR:',err.message); }
+  finally { polling=false; }
+}
+function startPolling() {
+  const loop=async()=>{ await poll(); setTimeout(loop,15000); };
+  loop().catch(err=>console.error('POLL LOOP ERROR:',err));
+}
+async function hasManagerRole(interaction) {
+  if (!interaction.inGuild()) return false;
+  try {
+    const member=await interaction.guild.members.fetch(interaction.user.id);
+    return member.roles.cache.has(cfg.managerRoleId);
+  } catch(err) { console.error('Role lookup failed:',err.message); return false; }
+}
+async function ensureDesignerNotification(designer,requestId) {
+  const list=await getDesigners(true);
+  const d=list.find(x=>x.name.normalize('NFC').toUpperCase() === designer.normalize('NFC').toUpperCase());
+  if (!d || !/^\d{15,22}$/.test(String(d.channelId||''))) throw new Error('Missing designer CHANNEL ID in SETTINGS column E');
+  const channel=await client.channels.fetch(d.channelId);
+  if (!channel || !channel.messages || typeof channel.send !== 'function') throw new Error('Designer channel is inaccessible');
+  const {found}=await scanRecentTasks(channel,300);
+  if (found.has(requestId)) return false;
+  const task=await api('task',{requestId});
+  if (!task.requestId) throw new Error('Task no longer exists');
+  await channel.send({content:`🎨 Task dành cho ${short(designer,80)}`,embeds:[createTaskEmbed(task,'🎨 TASK ĐƯỢC GIAO')],components:statusRows(requestId),allowedMentions:{parse:[]}});
+  return true;
+}
+async function notifyChannel(channelId,text) {
+  const channel=await client.channels.fetch(channelId);
+  if (!channel || typeof channel.send !== 'function') throw new Error('Notification channel inaccessible');
+  await channel.send({content:text,allowedMentions:{parse:[]}});
+}
 
-    // --- NÚT CẬP NHẬT TRẠNG THÁI ---
-    if (customId.startsWith("status_")) {
-      const parts = customId.split("_");
-      const status = parts[1];
-      const requestId = parts[2];
-
-      await apiPost({
-        action: "status",
-        requestId,
-        status
-      });
-
-      if (status === "Review") {
-        try {
-          const reviewChannel = await client.channels.fetch(CHANNEL_REVIEW);
-          if (reviewChannel) {
-            await reviewChannel.send({ content: `👀 Task cần review: ${requestId}` });
-          }
-        } catch (e) {}
-      }
-
-      if (status === "Done") {
-        try {
-          const doneChannel = await client.channels.fetch(CHANNEL_DONE);
-          if (doneChannel) {
-            await doneChannel.send({ content: `✅ Task hoàn thành: ${requestId}` });
-          }
-        } catch (e) {}
-      }
-
-      await interaction.reply({
-        content: `✅ Đã cập nhật: ${status}`,
-        ephemeral: true
-      });
-
-      return;
+client.on('messageCreate',async message=>{
+  if (message.author.bot) return;
+  const command = message.content.trim().split(/\s+/);
+  if (!['!checkdup','!cleandup','!notify','!reconcile'].includes(command[0])) return;
+  if (!message.member?.roles?.cache?.has(cfg.managerRoleId)) return message.reply('❌ Không có quyền.');
+  try {
+    if (command[0] === '!notify') {
+      const requestId=command[1];
+      if (!requestId) return message.reply('Cú pháp: !notify TASK-...');
+      const task=await api('task',{requestId});
+      if (!task.requestId || !task.designer) throw new Error('Task chưa được giao');
+      const posted=await ensureDesignerNotification(String(task.designer),requestId);
+      return message.reply(posted ? '✅ Đã gửi thông báo.' : '✅ Thông báo đã tồn tại trong 300 tin gần nhất.');
     }
-  } catch (err) {
-    console.error("INTERACTION ERROR:", err);
+    if (command[0] === '!reconcile') {
+      const requestId=command[1];
+      if (!requestId) return message.reply('Cú pháp: !reconcile TASK-...');
+      const channel=await client.channels.fetch(cfg.newChannel);
+      const {found}=await scanRecentTasks(channel,300);
+      const msg=found.get(requestId);
+      if (!msg) return message.reply('⚠️ Không tìm thấy trong 300 tin gần nhất; giữ nguyên POSTING. Kiểm tra thủ công trước khi reset.');
+      await api('discordInfo',{requestId,messageId:msg.id,channelId:channel.id,messageUrl:msg.url});
+      return message.reply('✅ Đã đối soát Message ID vào Sheet.');
+    }
+    const count=await duplicateReport();
+    await message.reply(`🔎 Đã kiểm tra 300 tin gần nhất: ${count} tin trùng. Để bảo vệ link và audit, bot KHÔNG tự xóa.`);
+  } catch(err) { await message.reply(`❌ ${short(err.message,1500)}`); }
+});
+client.on('interactionCreate',async interaction=>{
+  if (!interaction.isButton()) return;
+  const customId=interaction.customId;
+  const isAssign=customId.startsWith('assign_');
+  const isStatus=customId.startsWith('status:') || customId.startsWith('status_');
+  if (!isAssign && !isStatus) return;
+  try {
+    await interaction.deferReply({ephemeral:true}); // acknowledge within 3 seconds
+    const manager=await hasManagerRole(interaction);
+    if (isAssign) {
+      if (!manager) return interaction.editReply('❌ Chỉ Manager được phân công task.');
+      const designer=customId.slice('assign_'.length).trim().normalize('NFC');
+      const reqId=embeddedRequestId(interaction.message);
+      if (!reqId) throw new Error('Request ID missing from source message');
+      const result=await api('assign',{requestId:reqId,designer});
+      let note='';
+      try { await ensureDesignerNotification(result.designer,reqId); }
+      catch(err) { note=`\n⚠️ Task đã assign nhưng chưa thông báo cho Designer: ${short(err.message,250)}. Hãy kiểm tra SETTINGS và thực hiện lại.`; }
+      try {
+        const task=await api('task',{requestId:reqId});
+        await interaction.message.edit({embeds:[createTaskEmbed(task,'✅ ĐÃ PHÂN CÔNG')],components:[],allowedMentions:{parse:[]}});
+      } catch(err) { note+=`\n⚠️ Không cập nhật được embed: ${short(err.message,150)}`; }
+      return interaction.editReply(`✅ Task ${reqId} được giao cho **${result.designer}**.${note}`);
+    }
+    let status,reqId;
+    if (customId.startsWith('status:')) {
+      const m=/^status:(doing|review|revision|done):(.+)$/.exec(customId);
+      if (!m) throw new Error('Malformed status button');
+      status=STATUS_CODES[m[1]];reqId=m[2];
+    } else {
+      const m=/^status_(In Progress|Doing|Review|Revision|Done)_(.+)$/.exec(customId);
+      if (!m) throw new Error('Malformed legacy status button');
+      status=m[1] === 'In Progress' ? 'Doing' : m[1];reqId=m[2];
+    }
+    const task=await api('task',{requestId:reqId});
+    if (!task.requestId) throw new Error('Task not found');
+    const designers=await getDesigners(true);
+    const assigned=designers.find(d=>d.name.toUpperCase() === String(task.designer||'').trim().normalize('NFC').toUpperCase());
+    const owner=Boolean(assigned && assigned.discordUserId && String(assigned.discordUserId) === interaction.user.id);
+    if (status === 'Done' || status === 'Revision') {
+      if (!manager) return interaction.editReply('❌ Chỉ Manager mới được duyệt Done hoặc yêu cầu Revision.');
+    } else if (!manager && !owner) {
+      return interaction.editReply('❌ Chỉ designer được giao hoặc Manager mới có thể cập nhật task. Kiểm tra SETTINGS cột C.');
+    }
+    const result=await api('status',{requestId:reqId,status});
+    let warning='';
+    if (result.changed && status === 'Review') {
+      try {await notifyChannel(cfg.reviewChannel,`👀 Task chờ review: ${reqId}`);} catch(err){warning=` ⚠️ Không gửi được thông báo Review: ${short(err.message,150)}`;}
+    }
+    if (result.changed && status === 'Done') {
+      try {await notifyChannel(cfg.doneChannel,`✅ Task hoàn thành: ${reqId}`);} catch(err){warning=` ⚠️ Không gửi được thông báo Done: ${short(err.message,150)}`;}
+    }
     try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: "❌ Có lỗi xảy ra.", ephemeral: true });
-      } else {
-        await interaction.reply({ content: "❌ Có lỗi xảy ra.", ephemeral: true });
-      }
-    } catch (e) {}
+      const updated=await api('task',{requestId:reqId});
+      await interaction.message.edit({embeds:[createTaskEmbed(updated,'🎨 TASK ĐƯỢC GIAO')],components:(status==='Done'?[]:statusRows(reqId)),allowedMentions:{parse:[]}});
+    } catch(err) { warning+=` ⚠️ Embed chưa cập nhật.`; }
+    return interaction.editReply(`✅ ${reqId}: **${result.status}**${result.changed?'':' (đã ở trạng thái này)'}${warning}`);
+  } catch(err) {
+    console.error('INTERACTION ERROR:',err);
+    const text=`❌ ${short(err.message,1500)}`;
+    try { if (interaction.deferred || interaction.replied) await interaction.editReply(text); else await interaction.reply({content:text,ephemeral:true}); } catch(_) {}
   }
 });
-
-// ======================================================
-// LOGIN DISCORD CLIENT
-// ======================================================
-
-client.login(process.env.DISCORD_TOKEN);
+client.once('ready',()=>{
+  console.log('Logged in:',client.user.tag);
+  duplicateReport().catch(err=>console.error('Initial duplicate audit:',err.message));
+  startPolling();
+});
+client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
