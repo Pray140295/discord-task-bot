@@ -215,9 +215,13 @@ client.on("interactionCreate", async (interaction) => {
   try {
     const customId = interaction.customId;
 
+    // ==================================================
+    // ASSIGN
+    // ==================================================
     if (customId.startsWith("assign_")) {
       const member = interaction.member;
 
+      // 1. Xác thực quyền Quản trị
       if (!member.roles.cache.has(MANAGER_ROLE_ID)) {
         return interaction.reply({
           content: "❌ Bạn không có quyền assign task.",
@@ -225,14 +229,19 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      const designer = customId.replace("assign_", "");
+      // 2. Phản hồi Discord lập tức để tránh lỗi hết hạn tương tác (3 giây)
+      await interaction.deferUpdate().catch(() => {});
+
+      // Chuẩn hóa tên Designer khử lỗi bảng mã tiếng Việt Unicode
+      const designerRaw = customId.replace("assign_", "");
+      const designer = String(designerRaw).trim().normalize("NFC");
+
       const embed = interaction.message.embeds[0];
       const requestId = embed.fields[0].value;
 
       console.log("ASSIGN REQUEST:", { requestId, designer });
 
-      await interaction.deferUpdate();
-
+      // 3. Ghi nhận Designer lên Google Sheet
       const result = await apiPost({
         action: "assign",
         requestId,
@@ -241,35 +250,49 @@ client.on("interactionCreate", async (interaction) => {
 
       console.log("Assign Result:", result);
 
-      const task = await apiPost({
-        action: "task",
-        requestId
-      });
-
-      const designerChannelMap = {
-        "HUYNH": "1511559274625765480",
-        "NANCY": "1511559338043641916",
-        "NGỌC": "1511559317298352288"
-      };
-
-      const targetChannelId = designerChannelMap[designer];
-      if (targetChannelId) {
-        const targetChannel = await client.channels.fetch(targetChannelId);
-        await targetChannel.send({
-          content: `🎨 Task mới cho ${designer}`,
-          embeds: [createTaskEmbed(task)],
-          components: [createStatusButtons(requestId)]
-        });
-      }
-
+      // 4. Cập nhật nút bấm thành trạng thái đã giao việc
       await interaction.editReply({
-        content: `✅ Đã assign cho ${designer}`,
+        content: `✅ Đã assign cho **${designer}**`,
         components: []
-      });
+      }).catch(console.error);
+
+      // 5. Luồng gửi thông báo vào kênh cá nhân Designer (bọc riêng để tránh treo bot)
+      try {
+        const designerChannelMap = {
+          "HUYNH": "1511559274625765480",
+          "NANCY": "1511559338043641916",
+          "NGỌC": "1511559317298352288"
+        };
+
+        const targetChannelId = designerChannelMap[designer] || designerChannelMap[designer.toUpperCase()];
+
+        if (targetChannelId) {
+          const task = await apiPost({
+            action: "task",
+            requestId
+          });
+
+          const targetChannel = await client.channels.fetch(targetChannelId);
+          if (targetChannel) {
+            await targetChannel.send({
+              content: `🎨 Task mới cho ${designer}`,
+              embeds: [createTaskEmbed(task)],
+              components: [createStatusButtons(requestId)]
+            });
+          }
+        } else {
+          console.log(`⚠️ Không tìm thấy channel map cho Designer: ${designer}`);
+        }
+      } catch (notifyErr) {
+        console.error("⚠️ Lỗi gửi tin sang kênh riêng Designer:", notifyErr.message);
+      }
 
       return;
     }
 
+    // ==================================================
+    // STATUS
+    // ==================================================
     if (customId.startsWith("status_")) {
       const parts = customId.split("_");
       const status = parts[1];
@@ -282,17 +305,29 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       if (status === "Review") {
-        const reviewChannel = await client.channels.fetch(CHANNEL_REVIEW);
-        await reviewChannel.send({
-          content: `👀 Task cần review: ${requestId}`
-        });
+        try {
+          const reviewChannel = await client.channels.fetch(CHANNEL_REVIEW);
+          if (reviewChannel) {
+            await reviewChannel.send({
+              content: `👀 Task cần review: ${requestId}`
+            });
+          }
+        } catch (e) {
+          console.error("Lỗi gửi kênh Review:", e.message);
+        }
       }
 
       if (status === "Done") {
-        const doneChannel = await client.channels.fetch(CHANNEL_DONE);
-        await doneChannel.send({
-          content: `✅ Task hoàn thành: ${requestId}`
-        });
+        try {
+          const doneChannel = await client.channels.fetch(CHANNEL_DONE);
+          if (doneChannel) {
+            await doneChannel.send({
+              content: `✅ Task hoàn thành: ${requestId}`
+            });
+          }
+        } catch (e) {
+          console.error("Lỗi gửi kênh Done:", e.message);
+        }
       }
 
       await interaction.reply({
