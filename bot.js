@@ -305,7 +305,7 @@ client.on('interactionCreate',async interaction=>{
     try { if (interaction.deferred || interaction.replied) await interaction.editReply(text); else await interaction.reply({content:text,ephemeral:true}); } catch(_) {}
   }
 });
-client.once('ready',()=>{
+client.once("clientReady", async () => {
   console.log('Logged in:',client.user.tag);
   duplicateReport().catch(err=>console.error('Initial duplicate audit:',err.message));
   startPolling();
