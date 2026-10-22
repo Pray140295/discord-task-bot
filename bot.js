@@ -390,11 +390,16 @@ async function diagnoseDiscordRest() {
       }
     });
 
-    console.log('DISCORD_REST_PROBE', {
-      httpStatus: response.status,
-      ok: response.ok,
-      elapsedMs: Date.now() - started
-    });
+console.log('DISCORD_REST_PROBE', {
+  httpStatus: response.status,
+  ok: response.ok,
+  elapsedMs: Date.now() - started,
+  retryAfter: response.headers.get('retry-after'),
+  rateLimitScope: response.headers.get('x-ratelimit-scope'),
+  rateLimitGlobal: response.headers.get('x-ratelimit-global'),
+  contentType: response.headers.get('content-type'),
+  cfRayPresent: response.headers.has('cf-ray')
+});
   } catch (err) {
     console.error('DISCORD_REST_PROBE_FAILED', {
       errorName: err?.name,
