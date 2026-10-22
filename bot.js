@@ -342,4 +342,38 @@ client.once("clientReady", async () => {
   duplicateReport().catch(err=>console.error('Initial duplicate audit:',err.message));
   startPolling();
 });
+// DISCORD-GATEWAY-DIAG-01 — diagnostic logging only.
+
+client.on('error', err => {
+  console.error('GATEWAY_CLIENT_ERROR:', err?.code, err?.message);
+});
+
+client.on('warn', warning => {
+  console.warn('GATEWAY_WARNING:', String(warning).slice(0, 300));
+});
+
+client.on('shardError', (err, shardId) => {
+  console.error('GATEWAY_SHARD_ERROR:', {
+    shardId,
+    code: err?.code,
+    message: err?.message
+  });
+});
+
+client.on('shardDisconnect', (event, shardId) => {
+  console.error('GATEWAY_SHARD_DISCONNECT:', {
+    shardId,
+    closeCode: event?.code
+  });
+});
+
+client.on('shardReconnecting', shardId => {
+  console.log('GATEWAY_SHARD_RECONNECTING:', shardId);
+});
+
+client.on('shardReady', shardId => {
+  console.log('GATEWAY_SHARD_READY:', shardId);
+});
+
+console.log('DISCORD_LOGIN_START');
 client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
