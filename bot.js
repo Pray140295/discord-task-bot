@@ -377,3 +377,24 @@ client.on('shardReady', shardId => {
 
 console.log('DISCORD_LOGIN_START');
 client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
+// DISCORD-GATEWAY-DIAG-02 — observation only.
+// Does not cancel login, reconnect, restart or send messages.
+for (const seconds of [30, 60]) {
+  setTimeout(() => {
+    if (client.isReady()) return;
+
+    const shardStates = client.ws.shards
+      ? Array.from(client.ws.shards.entries()).map(([id, shard]) => ({
+          shardId: id,
+          status: shard.status
+        }))
+      : [];
+
+    console.warn(`DISCORD_LOGIN_PENDING_AFTER_${seconds}S`, {
+      ready: client.isReady(),
+      wsStatus: client.ws.status,
+      shardCount: client.ws.shards?.size ?? 0,
+      shardStates
+    });
+  }, seconds * 1000);
+}
