@@ -375,6 +375,36 @@ client.on('shardReady', shardId => {
   console.log('GATEWAY_SHARD_READY:', shardId);
 });
 
+// DISCORD-GATEWAY-DIAG-03 — public REST connectivity probe.
+// No token, authorization header, message send or application data.
+
+async function diagnoseDiscordRest() {
+  const started = Date.now();
+
+  try {
+    const response = await fetch('https://discord.com/api/v10/gateway', {
+      method: 'GET',
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+
+    console.log('DISCORD_REST_PROBE', {
+      httpStatus: response.status,
+      ok: response.ok,
+      elapsedMs: Date.now() - started
+    });
+  } catch (err) {
+    console.error('DISCORD_REST_PROBE_FAILED', {
+      errorName: err?.name,
+      errorCode: err?.cause?.code || err?.code || 'UNKNOWN',
+      elapsedMs: Date.now() - started
+    });
+  }
+}
+
+void diagnoseDiscordRest();
 console.log('DISCORD_LOGIN_START');
 client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
 // DISCORD-GATEWAY-DIAG-02 — observation only.
