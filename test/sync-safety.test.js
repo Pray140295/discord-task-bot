@@ -9,6 +9,10 @@ const APPS_SCRIPT_SOURCE = fs.readFileSync(
   path.join(__dirname, '..', '..', 'sources', 'DiscordAPI.gs.txt'),
   'utf8'
 );
+const SYNC_03A_SOURCE = fs.readFileSync(
+  path.join(__dirname, '..', 'apps-script', 'SyncSafety03A.gs'),
+  'utf8'
+);
 
 class ChainBuilder {
   constructor() { this.data = { fields: [] }; }
@@ -64,7 +68,17 @@ function makeChannel(initial = [], sendBehavior) {
   return channel;
 }
 
-function loadBot({ channel, apiHandler }) {
+const TEST_ALLOWLIST = [
+  'TASK-LOCAL-RACE','TASK-ATOMIC','TASK-NONATOMIC','TASK-CLAIM-TIMEOUT',
+  'TASK-SEND-TIMEOUT','TASK-INFO-TIMEOUT','TASK-POSTING','TASK-TOO-OLD',
+  'TASK-GATE','TASK-CONTRACT','TASK-UNKNOWN','TASK-CONFLICT'
+].join(',');
+const CONTRACT = {
+  version: 'SYNC-SAFETY-03A/1', claimId: true, fencing: true,
+  postingNoRetry: true, idempotentDiscordInfo: true
+};
+
+function loadBot({ channel, apiHandler, sendEnabled = true, allowlist = TEST_ALLOWLIST, contract = CONTRACT, autoClaimId = true }) {
   const handlers = {};
   const logs = [];
   const client = {
@@ -78,7 +92,13 @@ function loadBot({ channel, apiHandler }) {
   const sandbox = {
     require(name) {
       if (name === 'dotenv') return { config() {} };
-      if (name === 'axios') return { post: async (_url, body) => ({ data: await apiHandler(body) }) };
+      if (name === 'axios') return { post: async (_url, body) => {
+        if (body.action === 'syncContract') return { data: contract };
+        const data = await apiHandler(body);
+        if (autoClaimId && body.action === 'claimSync' && data?.claimed && !data.claimId)
+          data.claimId = 'test-claim-id-0001';
+        return { data };
+      } };
       if (name === 'express') {
         return () => ({ get() {}, listen() {} });
       }
@@ -102,7 +122,9 @@ function loadBot({ channel, apiHandler }) {
         MANAGER_ROLE_ID: 'manager',
         CHANNEL_TASK_NEW: 'new-channel',
         CHANNEL_REVIEW: 'review-channel',
-        CHANNEL_DONE: 'done-channel'
+        CHANNEL_DONE: 'done-channel',
+        DISCORD_SYNC_SEND_ENABLED: sendEnabled ? 'true' : '',
+        DISCORD_SYNC_ALLOWLIST: allowlist
       },
       exitCode: 0
     },
@@ -133,6 +155,52 @@ function basicApi(requestId, claim) {
     if (body.action === 'discordInfo') return { success: true };
     throw new Error(`Unexpected action: ${body.action}`);
   };
+}
+
+function loadSync03A() {
+  const properties = new Map();
+  const record = ['', '', '', '', '', '', ''];
+  const state = { record, flushes: 0 };
+  const sheet = {
+    getRange(_row, column, _rows, columns) {
+      return {
+        getValues: () => [columns === 7 ? record.slice() : ['']],
+        setValue(value) {
+          if (column === 28) record[5] = value;
+          if (column === 29) record[6] = value;
+          return this;
+        },
+        setValues(values) { values[0].forEach((value, index) => { record[index] = value; }); return this; }
+      };
+    }
+  };
+  let uuid = 0;
+  const sandbox = {
+    JSON, Date,
+    console: { error() {} },
+    COL: { MESSAGE_ID: 23, SYNC_STATUS: 28, LAST_UPDATE: 29 },
+    apiLock: fn => fn(),
+    findTaskRow: () => 5,
+    getTaskSheet: () => sheet,
+    getSpreadsheet: () => ({}),
+    dispatchToDesigner() {},
+    apiFailure: (message, code) => ({ success: false, message, code }),
+    SpreadsheetApp: { flush: () => { state.flushes += 1; } },
+    PropertiesService: { getScriptProperties: () => ({
+      getProperty: key => properties.get(key) || null,
+      setProperty: (key, value) => properties.set(key, value),
+      deleteProperty: key => properties.delete(key)
+    }) },
+    Utilities: {
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
+      computeDigest: (_algorithm, text) => Array.from(Buffer.from(String(text).padEnd(32, '0')).subarray(0, 32)),
+      base64EncodeWebSafe: bytes => Buffer.from(bytes).toString('base64url'),
+      getUuid: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}`
+    }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(SYNC_03A_SOURCE, sandbox, { filename: 'SyncSafety03A.gs' });
+  return { sandbox, state, properties };
 }
 
 test('one process suppresses overlapping poll loops', async () => {
@@ -246,6 +314,155 @@ test('POSTING payload prevents an automatic repost', async () => {
   await bot.poll();
   assert.equal(channel.sent, 0);
   assert.equal(claimCalls, 0);
+});
+
+test('kill switch defaults to OFF and does not claim or send', async () => {
+  const channel = makeChannel();
+  let claimCalls = 0;
+  const bot = loadBot({
+    channel,
+    sendEnabled: false,
+    apiHandler: async body => {
+      if (body.action === 'unsynced') return [task('TASK-GATE')];
+      if (body.action === 'claimSync') claimCalls += 1;
+      throw new Error(`Unexpected action: ${body.action}`);
+    }
+  });
+  await bot.poll();
+  assert.equal(channel.sent, 0);
+  assert.equal(claimCalls, 0);
+});
+
+test('kill switch OFF also blocks discordInfo reconciliation writes', async () => {
+  const channel = makeChannel([{ id: '900', requestId: 'TASK-GATE' }]);
+  let infoWrites = 0;
+  const bot = loadBot({
+    channel,
+    sendEnabled: false,
+    apiHandler: async body => {
+      if (body.action === 'unsynced') return [task('TASK-GATE')];
+      if (body.action === 'discordInfo') { infoWrites += 1; return { success: true }; }
+      throw new Error(`Unexpected action: ${body.action}`);
+    }
+  });
+  await bot.poll();
+  assert.equal(infoWrites, 0);
+  assert.equal(channel.sent, 0);
+});
+
+test('allowlist is deny-by-default', async () => {
+  const channel = makeChannel();
+  let claimCalls = 0;
+  const bot = loadBot({
+    channel,
+    allowlist: '',
+    apiHandler: async body => {
+      if (body.action === 'unsynced') return [task('TASK-GATE')];
+      if (body.action === 'claimSync') claimCalls += 1;
+      throw new Error(`Unexpected action: ${body.action}`);
+    }
+  });
+  await bot.poll();
+  assert.equal(channel.sent, 0);
+  assert.equal(claimCalls, 0);
+});
+
+test('contract handshake mismatch fails closed before claim', async () => {
+  const channel = makeChannel();
+  let claimCalls = 0;
+  const bot = loadBot({
+    channel,
+    contract: { ...CONTRACT, fencing: false },
+    apiHandler: async body => {
+      if (body.action === 'unsynced') return [task('TASK-CONTRACT')];
+      if (body.action === 'claimSync') claimCalls += 1;
+      throw new Error(`Unexpected action: ${body.action}`);
+    }
+  });
+  await bot.poll();
+  assert.equal(channel.sent, 0);
+  assert.equal(claimCalls, 0);
+});
+
+test('claimed response without a valid claimId fails closed', async () => {
+  const channel = makeChannel();
+  const bot = loadBot({
+    channel,
+    autoClaimId: false,
+    apiHandler: basicApi('TASK-UNKNOWN', async () => ({ claimed: true }))
+  });
+  await bot.poll();
+  assert.equal(channel.sent, 0);
+});
+
+test('Discord REST retries are disabled for ambiguous create-message outcomes', () => {
+  assert.match(BOT_SOURCE, /rest:\{retries:0\}/);
+});
+
+for (const failure of ['HTTP 500 after accepted', 'ECONNRESET after accepted']) {
+  test(`${failure} leaves one discoverable message and never reposts`, async () => {
+    let firstSend = true;
+    const channel = makeChannel([], async () => {
+      if (firstSend) { firstSend = false; throw new Error(failure); }
+    });
+    let infoWrites = 0;
+    const bot = loadBot({
+      channel,
+      apiHandler: async body => {
+        if (body.action === 'unsynced') return [task('TASK-UNKNOWN')];
+        if (body.action === 'designers') return [{ name: 'DESIGNER' }];
+        if (body.action === 'claimSync') return { claimed: true, claimId: 'claim-token-00000001' };
+        if (body.action === 'discordInfo') { infoWrites += 1; return { success: true }; }
+      }
+    });
+    await bot.poll();
+    await bot.poll();
+    assert.equal(channel.sent, 1);
+    assert.equal(infoWrites, 1);
+  });
+}
+
+test('candidate concurrent claims produce one fenced winner', () => {
+  const { sandbox, state } = loadSync03A();
+  const first = sandbox.claimDiscordSync('TASK-CLAIM');
+  const second = sandbox.claimDiscordSync('TASK-CLAIM');
+  assert.equal(first.claimed, true);
+  assert.match(first.claimId, /^[A-Za-z0-9_-]{16,128}$/);
+  assert.equal(second.claimed, false);
+  assert.equal(second.reason, 'NEEDS_RECONCILIATION');
+  assert.equal(state.record[5], 'POSTING');
+});
+
+test('candidate discordInfo is fenced, idempotent, and conflict preserving', () => {
+  const { sandbox, state } = loadSync03A();
+  const claim = sandbox.claimDiscordSync('TASK-FENCE');
+  const wrong = sandbox.saveDiscordInfo({
+    requestId: 'TASK-FENCE', claimId: 'stale-claim-token',
+    messageId: '123456789012345678', channelId: '223456789012345678'
+  });
+  assert.equal(wrong.code, 'CLAIM_CONFLICT');
+  const saved = sandbox.saveDiscordInfo({
+    requestId: 'TASK-FENCE', claimId: claim.claimId,
+    messageId: '123456789012345678', channelId: '223456789012345678'
+  });
+  assert.equal(saved.changed, true);
+  const same = sandbox.saveDiscordInfo({
+    requestId: 'TASK-FENCE', claimId: '',
+    messageId: '123456789012345678', channelId: '223456789012345678'
+  });
+  assert.equal(same.idempotent, true);
+  const conflict = sandbox.saveDiscordInfo({
+    requestId: 'TASK-FENCE', claimId: claim.claimId,
+    messageId: '323456789012345678', channelId: '223456789012345678'
+  });
+  assert.equal(conflict.code, 'MESSAGE_CONFLICT');
+  assert.equal(state.record[0], '123456789012345678');
+});
+
+test('candidate source and bot contain no credential literals', () => {
+  for (const source of [BOT_SOURCE, SYNC_03A_SOURCE]) {
+    assert.doesNotMatch(source, /(?:discord|google)[_-]?(?:token|secret)\s*[:=]\s*['\"][A-Za-z0-9_-]{24,}/i);
+  }
 });
 
 test('a message outside the 300-message scan window can be reposted if the claim layer fails', async () => {

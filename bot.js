@@ -20,9 +20,15 @@ const cfg = {
   managerRoleId: process.env.MANAGER_ROLE_ID,
   newChannel: process.env.CHANNEL_TASK_NEW,
   reviewChannel: process.env.CHANNEL_REVIEW,
-  doneChannel: process.env.CHANNEL_DONE
+  doneChannel: process.env.CHANNEL_DONE,
+  sendEnabled: String(process.env.DISCORD_SYNC_SEND_ENABLED || '').toLowerCase() === 'true',
+  sendAllowlist: new Set(String(process.env.DISCORD_SYNC_ALLOWLIST || '').split(',').map(value => value.trim()).filter(Boolean))
 };
-const client = new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent]});
+// Discord message creation is not safe to retry after an ambiguous network failure.
+const client = new Client({
+  intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent],
+  rest:{retries:0}
+});
 const app = express();
 app.get('/', (_req,res) => res.send('Bot Online'));
 app.get('/ping', (_req,res) => res.status(client.isReady()?200:503).send(client.isReady()?'pong':'Discord not connected'));
@@ -55,6 +61,22 @@ async function getDesigners(force=false) {
   return designerCache;
 }
 const idOf = x => String(x || '').trim();
+const SYNC_CONTRACT_VERSION = 'SYNC-SAFETY-03A/1';
+let syncContractReady = false;
+async function requireSyncContract() {
+  if (syncContractReady) return;
+  const contract = await api('syncContract');
+  const required = contract && contract.version === SYNC_CONTRACT_VERSION &&
+    contract.claimId === true && contract.fencing === true &&
+    contract.postingNoRetry === true && contract.idempotentDiscordInfo === true;
+  if (!required) throw new Error('SYNC_CONTRACT_MISMATCH');
+  syncContractReady = true;
+}
+function sendGate(requestId) {
+  if (!cfg.sendEnabled) return 'SEND_DISABLED';
+  if (!cfg.sendAllowlist.has(requestId)) return 'NOT_ALLOWLISTED';
+  return '';
+}
 const short = (x,limit=200) => {
   const value = String(x === null || x === undefined || x === '' ? '-' : x);
   return value.length > limit ? value.slice(0,limit-1)+'…' : value;
@@ -154,13 +176,20 @@ async function poll() {
       if (!reqId || processing.has(reqId)) continue;
       processing.add(reqId);
       try {
+        const gate=sendGate(reqId);
+        if (gate) {
+          if (!warnings.has(`${gate}:${reqId}`)) console.log(`SYNC GATED: ${reqId} (${gate})`);
+          warnings.add(`${gate}:${reqId}`);
+          continue;
+        }
+        await requireSyncContract();
         // Old sends and uncertain POSTING sends: reconcile rather than sending a duplicate.
         let existing=scan.found.get(reqId);
         if (task.messageId && !existing) {
           try { existing=await channel.messages.fetch(String(task.messageId)); } catch (_) {}
         }
         if (existing) {
-          await api('discordInfo',{requestId:reqId,messageId:existing.id,channelId:existing.channel.id,messageUrl:existing.url});
+          await api('discordInfo',{requestId:reqId,claimId:idOf(task.claimId),messageId:existing.id,channelId:existing.channel.id,messageUrl:existing.url});
           continue;
         }
         const state=String(task.syncStatus || '').toUpperCase();
@@ -173,10 +202,12 @@ async function poll() {
         const rows=assignRows(designers);
         const claim=await api('claimSync',{requestId:reqId});
         if (!claim.claimed) continue;
+        const claimId=idOf(claim.claimId);
+        if (!/^[A-Za-z0-9_-]{16,128}$/.test(claimId)) throw new Error('INVALID_CLAIM_ID');
         // If send fails after claim, leave POSTING and reconcile rather than blindly retry.
         const msg=await channel.send({embeds:[createTaskEmbed(task,'📋 TASK MỚI')],components:rows,allowedMentions:{parse:[]}});
         scan.found.set(reqId,msg);
-        await api('discordInfo',{requestId:reqId,messageId:msg.id,channelId:channel.id,messageUrl:msg.url});
+        await api('discordInfo',{requestId:reqId,claimId,messageId:msg.id,channelId:channel.id,messageUrl:msg.url});
         console.log('SYNCED:',reqId,msg.id);
       } catch(err) { console.error('SYNC ERROR:',reqId,err.message); }
       finally { processing.delete(reqId); }
@@ -235,7 +266,8 @@ client.on('messageCreate',async message=>{
       const {found}=await scanRecentTasks(channel,300);
       const msg=found.get(requestId);
       if (!msg) return message.reply('⚠️ Không tìm thấy trong 300 tin gần nhất; giữ nguyên POSTING. Kiểm tra thủ công trước khi reset.');
-      await api('discordInfo',{requestId,messageId:msg.id,channelId:channel.id,messageUrl:msg.url});
+      const task=await api('task',{requestId});
+      await api('discordInfo',{requestId,claimId:idOf(task.claimId),messageId:msg.id,channelId:channel.id,messageUrl:msg.url});
       return message.reply('✅ Đã đối soát Message ID vào Sheet.');
     }
     const count=await duplicateReport();
