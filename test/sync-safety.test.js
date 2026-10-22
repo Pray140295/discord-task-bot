@@ -10,9 +10,11 @@ const APPS_SCRIPT_SOURCE = fs.readFileSync(
   'utf8'
 );
 const SYNC_03A_SOURCE = fs.readFileSync(
-  path.join(__dirname, '..', 'apps-script', 'SyncSafety03A.gs'),
+  path.join(__dirname, '..', 'apps-script', 'DiscordAPI.v22.sync-safety-03a.gs'),
   'utf8'
 );
+const ROLLOUT_ENV = fs.readFileSync(path.join(__dirname, '..', 'config', 'rollout.env.example'), 'utf8');
+const READ_ONLY_SMOKE = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'smoke-readonly.js'), 'utf8');
 
 class ChainBuilder {
   constructor() { this.data = { fields: [] }; }
@@ -157,20 +159,25 @@ function basicApi(requestId, claim) {
   };
 }
 
-function loadSync03A() {
-  const properties = new Map();
-  const record = ['', '', '', '', '', '', ''];
-  const state = { record, flushes: 0 };
+function loadSync03A({ shared, faults = {} } = {}) {
+  const properties = shared?.properties || new Map();
+  const record = shared?.record || ['', '', '', '', '', '', ''];
+  const state = shared?.state || { record, flushes: 0 };
   const sheet = {
     getRange(_row, column, _rows, columns) {
       return {
         getValues: () => [columns === 7 ? record.slice() : ['']],
         setValue(value) {
+          if (faults.sheetSetValue) throw new Error('INJECTED_SHEET_SET_VALUE');
           if (column === 28) record[5] = value;
           if (column === 29) record[6] = value;
           return this;
         },
-        setValues(values) { values[0].forEach((value, index) => { record[index] = value; }); return this; }
+        setValues(values) {
+          if (faults.sheetSetValues) throw new Error('INJECTED_SHEET_SET_VALUES');
+          values[0].forEach((value, index) => { record[index] = value; });
+          return this;
+        }
       };
     }
   };
@@ -179,17 +186,28 @@ function loadSync03A() {
     JSON, Date,
     console: { error() {} },
     COL: { MESSAGE_ID: 23, SYNC_STATUS: 28, LAST_UPDATE: 29 },
-    apiLock: fn => fn(),
-    findTaskRow: () => 5,
-    getTaskSheet: () => sheet,
-    getSpreadsheet: () => ({}),
+    CONFIG: { SHEET_ID: 'test-sheet', DB_NAME: 'tasks' },
+    getSS: () => ({ getSheetByName: () => sheet }),
+    LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() {} }) },
     dispatchToDesigner() {},
     apiFailure: (message, code) => ({ success: false, message, code }),
-    SpreadsheetApp: { flush: () => { state.flushes += 1; } },
+    SpreadsheetApp: { flush: () => {
+      state.flushes += 1;
+      if (faults.flush) throw new Error('INJECTED_FLUSH');
+    } },
     PropertiesService: { getScriptProperties: () => ({
-      getProperty: key => properties.get(key) || null,
-      setProperty: (key, value) => properties.set(key, value),
-      deleteProperty: key => properties.delete(key)
+      getProperty: key => {
+        if (faults.propertyGet) throw new Error('INJECTED_PROPERTY_GET');
+        return properties.get(key) || null;
+      },
+      setProperty: (key, value) => {
+        if (faults.propertySet) throw new Error('INJECTED_PROPERTY_SET');
+        properties.set(key, value);
+      },
+      deleteProperty: key => {
+        if (faults.propertyDelete) throw new Error('INJECTED_PROPERTY_DELETE');
+        properties.delete(key);
+      }
     }) },
     Utilities: {
       DigestAlgorithm: { SHA_256: 'SHA_256' },
@@ -199,8 +217,13 @@ function loadSync03A() {
     }
   };
   vm.createContext(sandbox);
-  vm.runInContext(SYNC_03A_SOURCE, sandbox, { filename: 'SyncSafety03A.gs' });
-  return { sandbox, state, properties };
+  vm.runInContext(SYNC_03A_SOURCE, sandbox, { filename: 'DiscordAPI.v22.sync-safety-03a.gs' });
+  // Isolate the sync protocol from unrelated Sheet parsing in this mock.
+  sandbox.apiLock = fn => fn();
+  sandbox.findTaskRow = () => 5;
+  sandbox.getTaskSheet = () => sheet;
+  sandbox.getSpreadsheet = () => ({});
+  return { sandbox, state, properties, shared: { properties, record, state } };
 }
 
 test('one process suppresses overlapping poll loops', async () => {
@@ -459,10 +482,111 @@ test('candidate discordInfo is fenced, idempotent, and conflict preserving', () 
   assert.equal(state.record[0], '123456789012345678');
 });
 
+test('complete Version 22 candidate exposes the exact fail-closed contract', () => {
+  const { sandbox } = loadSync03A();
+  const contract = sandbox.getDiscordSyncContract();
+  assert.equal(contract.version, 'SYNC-SAFETY-03A/1');
+  assert.equal(contract.claimStorage, 'SCRIPT_PROPERTIES');
+  assert.equal(contract.claimId, true);
+  assert.equal(contract.fencing, true);
+  assert.equal(contract.postingNoRetry, true);
+  assert.equal(contract.idempotentDiscordInfo, true);
+});
+
+test('property write failure occurs before POSTING and returns no claim', () => {
+  const { sandbox, state, properties } = loadSync03A({ faults: { propertySet: true } });
+  assert.throws(() => sandbox.claimDiscordSync('TASK-PROP-FAIL'), /INJECTED_PROPERTY_SET/);
+  assert.equal(state.record[5], '');
+  assert.equal(properties.size, 0);
+});
+
+test('Sheet write failure after property write remains fenced across restart', () => {
+  const first = loadSync03A({ faults: { sheetSetValue: true } });
+  assert.throws(() => first.sandbox.claimDiscordSync('TASK-SHEET-FAIL'), /INJECTED_SHEET_SET_VALUE/);
+  assert.equal(first.state.record[5], '');
+  assert.equal(first.properties.size, 1);
+  const restarted = loadSync03A({ shared: first.shared });
+  const retry = restarted.sandbox.claimDiscordSync('TASK-SHEET-FAIL');
+  assert.equal(retry.claimed, false);
+  assert.equal(retry.reason, 'NEEDS_RECONCILIATION');
+});
+
+test('claim flush failure remains POSTING and fenced across restart', () => {
+  const first = loadSync03A({ faults: { flush: true } });
+  assert.throws(() => first.sandbox.claimDiscordSync('TASK-FLUSH-FAIL'), /INJECTED_FLUSH/);
+  assert.equal(first.state.record[5], 'POSTING');
+  assert.equal(first.properties.size, 1);
+  const restarted = loadSync03A({ shared: first.shared });
+  assert.equal(restarted.sandbox.claimDiscordSync('TASK-FLUSH-FAIL').claimed, false);
+});
+
+test('discordInfo Sheet failure preserves POSTING claim for reconciliation', () => {
+  const first = loadSync03A();
+  const claim = first.sandbox.claimDiscordSync('TASK-FINALIZE-SHEET-FAIL');
+  const failing = loadSync03A({ shared: first.shared, faults: { sheetSetValues: true } });
+  assert.throws(() => failing.sandbox.saveDiscordInfo({
+    requestId: 'TASK-FINALIZE-SHEET-FAIL', claimId: claim.claimId,
+    messageId: '423456789012345678', channelId: '523456789012345678'
+  }), /INJECTED_SHEET_SET_VALUES/);
+  assert.equal(first.state.record[0], '');
+  assert.equal(first.state.record[5], 'POSTING');
+  assert.equal(first.properties.size, 1);
+});
+
+test('discordInfo flush uncertainty is idempotent after restart and preserves conflicts', () => {
+  const first = loadSync03A();
+  const claim = first.sandbox.claimDiscordSync('TASK-FINALIZE-FLUSH-FAIL');
+  const failing = loadSync03A({ shared: first.shared, faults: { flush: true } });
+  assert.throws(() => failing.sandbox.saveDiscordInfo({
+    requestId: 'TASK-FINALIZE-FLUSH-FAIL', claimId: claim.claimId,
+    messageId: '623456789012345678', channelId: '723456789012345678'
+  }), /INJECTED_FLUSH/);
+  const restarted = loadSync03A({ shared: first.shared });
+  const same = restarted.sandbox.saveDiscordInfo({
+    requestId: 'TASK-FINALIZE-FLUSH-FAIL', claimId: '',
+    messageId: '623456789012345678', channelId: '723456789012345678'
+  });
+  assert.equal(same.idempotent, true);
+  const conflict = restarted.sandbox.saveDiscordInfo({
+    requestId: 'TASK-FINALIZE-FLUSH-FAIL', claimId: claim.claimId,
+    messageId: '823456789012345678', channelId: '723456789012345678'
+  });
+  assert.equal(conflict.code, 'MESSAGE_CONFLICT');
+  assert.equal(first.state.record[0], '623456789012345678');
+});
+
+test('claim property deletion failure leaves a harmless durable stop marker', () => {
+  const first = loadSync03A();
+  const claim = first.sandbox.claimDiscordSync('TASK-DELETE-FAIL');
+  const failing = loadSync03A({ shared: first.shared, faults: { propertyDelete: true } });
+  assert.throws(() => failing.sandbox.saveDiscordInfo({
+    requestId: 'TASK-DELETE-FAIL', claimId: claim.claimId,
+    messageId: '923456789012345678', channelId: '123456789012345679'
+  }), /INJECTED_PROPERTY_DELETE/);
+  assert.equal(first.state.record[5], 'SYNCED');
+  assert.equal(first.properties.size, 1);
+  const restarted = loadSync03A({ shared: first.shared });
+  assert.equal(restarted.sandbox.saveDiscordInfo({
+    requestId: 'TASK-DELETE-FAIL', claimId: '',
+    messageId: '923456789012345678', channelId: '123456789012345679'
+  }).idempotent, true);
+});
+
 test('candidate source and bot contain no credential literals', () => {
-  for (const source of [BOT_SOURCE, SYNC_03A_SOURCE]) {
+  for (const source of [BOT_SOURCE, SYNC_03A_SOURCE, ROLLOUT_ENV, READ_ONLY_SMOKE]) {
     assert.doesNotMatch(source, /(?:discord|google)[_-]?(?:token|secret)\s*[:=]\s*['\"][A-Za-z0-9_-]{24,}/i);
   }
+});
+
+test('rollout configuration is non-sending and deny-by-default', () => {
+  assert.match(ROLLOUT_ENV, /^DISCORD_SYNC_SEND_ENABLED=false$/m);
+  assert.match(ROLLOUT_ENV, /^DISCORD_SYNC_ALLOWLIST=$/m);
+});
+
+test('smoke script performs only read-only health and contract calls', () => {
+  assert.match(READ_ONLY_SMOKE, /action:\s*'syncContract'/);
+  assert.doesNotMatch(READ_ONLY_SMOKE, /action:\s*'(claimSync|discordInfo|assign|status|autoAssign)'/);
+  assert.doesNotMatch(READ_ONLY_SMOKE, /console\.(?:log|error)\([^\n]*(?:TOKEN|scriptUrl|expectedSuffix|contractResponse)/);
 });
 
 test('a message outside the 300-message scan window can be reposted if the claim layer fails', async () => {

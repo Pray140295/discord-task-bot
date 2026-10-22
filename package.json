@@ -4,7 +4,8 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "test": "node --test"
+    "test": "node --test",
+    "smoke:readonly": "node scripts/smoke-readonly.js"
   },
   "dependencies": {
     "axios": "^1.7.2",

@@ -1,5 +1,7 @@
 # SYNC-SAFETY-03A — isolated implementation and qualification
 
+> Superseded by `SYNC-SAFETY-FINAL-QUALIFICATION.md`. The final package contains the complete Version 22 candidate and expanded fault-injection qualification.
+
 Base: production commit `bcbede2b41bd6bcc88c745abc04b7b904fcef589`.
 
 Branch/worktree: `sync-safety-03a` in the existing isolated `sync-safety-01` worktree. This package was built and tested locally only. It did not call production APIs, send Discord messages, submit a Form, change a Sheet, restart Render, deploy Apps Script, push, merge, or reset any `POSTING`/`SYNCED` state.
