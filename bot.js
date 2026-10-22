@@ -33,12 +33,29 @@ function apiProblem(action, data) {
   throw new Error(`${action}: ${msg}`);
 }
 async function api(action, data = {}) {
-  const res = await axios.post(cfg.url, { ...data, action, apiToken: cfg.token }, {
-    timeout: 30000, maxRedirects: 5, headers:{'Content-Type':'application/json'}
-  });
-  if (typeof res.data !== 'object' || res.data === null || typeof res.data === 'string') apiProblem(action, res.data);
-  if (res.data.success === false) apiProblem(action, res.data);
-  return res.data;
+  const startedAt=Date.now();
+  try {
+    const res = await axios.post(cfg.url, { ...data, action, apiToken: cfg.token }, {
+      timeout: 30000, maxRedirects: 5, headers:{'Content-Type':'application/json'}
+    });
+    if (typeof res.data !== 'object' || res.data === null || typeof res.data === 'string') apiProblem(action, res.data);
+    if (res.data.success === false) apiProblem(action, res.data);
+    return res.data;
+  } catch (err) {
+    const cause=err.cause || {};
+    console.error('API ERROR:',JSON.stringify({
+      action,
+      elapsedMs:Date.now()-startedAt,
+      code:err.code || cause.code || null,
+      errno:err.errno || cause.errno || null,
+      syscall:err.syscall || cause.syscall || null,
+      address:err.address || cause.address || null,
+      httpStatus:err.response?.status || null,
+      responseType:err.response?.headers?.['content-type'] || null,
+      message:short(err.message,500)
+    }));
+    throw err;
+  }
 }
 let designerCache = [], designerCacheAt = 0;
 async function getDesigners(force=false) {
