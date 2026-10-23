@@ -375,41 +375,48 @@ client.on('shardReady', shardId => {
   console.log('GATEWAY_SHARD_READY:', shardId);
 });
 
-// DISCORD-GATEWAY-DIAG-03 — public REST connectivity probe.
-// No token, authorization header, message send or application data.
+// DISCORD-GATEWAY-DIAG-05
+// Observe existing discord.js REST requests only.
+// No additional HTTP requests or credential logging.
 
-async function diagnoseDiscordRest() {
-  const started = Date.now();
-
-  try {
-    const response = await fetch('https://discord.com/api/v10/gateway', {
-      method: 'GET',
-      signal: AbortSignal.timeout(10000),
-      headers: {
-        'Accept': 'application/json'
-      }
-    });
-
-console.log('DISCORD_REST_PROBE', {
-  httpStatus: response.status,
-  ok: response.ok,
-  elapsedMs: Date.now() - started,
-  retryAfter: response.headers.get('retry-after'),
-  rateLimitScope: response.headers.get('x-ratelimit-scope'),
-  rateLimitGlobal: response.headers.get('x-ratelimit-global'),
-  contentType: response.headers.get('content-type'),
-  cfRayPresent: response.headers.has('cf-ray')
-});
-  } catch (err) {
-    console.error('DISCORD_REST_PROBE_FAILED', {
-      errorName: err?.name,
-      errorCode: err?.cause?.code || err?.code || 'UNKNOWN',
-      elapsedMs: Date.now() - started
-    });
-  }
+function isGatewayBotRoute(path) {
+  return typeof path === 'string' &&
+    path.split('?')[0] === '/gateway/bot';
 }
 
-void diagnoseDiscordRest();
+let diag05ResponsesLogged = 0;
+let diag05RateLimitsLogged = 0;
+
+client.rest.on('response', (request, response) => {
+  if (!isGatewayBotRoute(request?.path)) return;
+  if (diag05ResponsesLogged >= 3) return;
+
+  diag05ResponsesLogged++;
+
+  console.log('DISCORD_GATEWAY_REST_RESPONSE', {
+    httpStatus: response.status,
+    ok: response.ok,
+    retryAfter: response.headers.get('retry-after'),
+    rateLimitScope: response.headers.get('x-ratelimit-scope'),
+    rateLimitGlobal: response.headers.get('x-ratelimit-global'),
+    contentType: response.headers.get('content-type'),
+    cfRayPresent: response.headers.has('cf-ray')
+  });
+});
+
+client.rest.on('rateLimited', info => {
+  if (!isGatewayBotRoute(info?.route)) return;
+  if (diag05RateLimitsLogged >= 3) return;
+
+  diag05RateLimitsLogged++;
+
+  console.log('DISCORD_GATEWAY_RATE_LIMITED', {
+    retryAfterMs: info.retryAfter,
+    scope: info.scope,
+    global: info.global
+  });
+});
+
 console.log('DISCORD_LOGIN_START');
 client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
 // DISCORD-GATEWAY-DIAG-02 — observation only.
