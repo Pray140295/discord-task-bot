@@ -1,0 +1,3 @@
+# bot.js is stored with CRLF in this repository.
+# Treat CR as part of the line ending so added lines are not reported as trailing whitespace.
+bot.js whitespace=cr-at-eol

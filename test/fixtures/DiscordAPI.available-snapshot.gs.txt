@@ -1,0 +1,416 @@
+// ════════════════════════════════════════════════════════════════════════
+// THISKYHALL DISCORD API // Version 2.0 (ULTIMATE EDITION)
+// Google Sheet <-> Discord Render Bot
+// ════════════════════════════════════════════════════════════════════════
+
+var SHEET_ID = (typeof CONFIG !== "undefined" && CONFIG.SHEET_ID) ? CONFIG.SHEET_ID : "TEST_SHEET_ID_NOT_PRODUCTION";
+var TASK_SHEET = (typeof CONFIG !== "undefined" && CONFIG.DB_NAME) ? CONFIG.DB_NAME : "Thông Tin Task";
+
+// ===============================
+// COLUMN MAP
+// ===============================
+var COL = {
+  REQUEST_ID: 2,          // B
+  DESIGNER: 15,           // O
+  STATUS: 16,             // P
+  ROUND: 17,              // Q
+  ASSIGNED_DATE: 18,      // R
+  START_TIME: 19,         // S
+  REVIEW_TIME: 20,        // T
+  DONE_TIME: 21,          // U
+  FINAL_LINK: 22,         // V
+  MESSAGE_ID: 23,         // W
+  CHANNEL_ID: 24,         // X
+  THREAD_ID: 25,          // Y
+  MESSAGE_URL: 26,        // Z
+  THREAD_URL: 27,         // AA
+  SYNC_STATUS: 28,        // AB
+  LAST_UPDATE: 29         // AC
+};
+
+function getSpreadsheet() {
+  return (typeof getSS === "function") ? getSS() : SpreadsheetApp.openById(SHEET_ID);
+}
+
+function getTaskSheet() {
+  return getSpreadsheet().getSheetByName(TASK_SHEET);
+}
+
+// ===============================
+// DO GET
+// ===============================
+function doGet(e) {
+  try {
+    var action = (e && e.parameter && e.parameter.action) ? e.parameter.action : "";
+
+    switch (action) {
+      case "unsynced":
+        return jsonResponse(getUnsyncedTasks());
+
+      case "task":
+        return jsonResponse(getTaskById(e.parameter.requestId));
+
+      // 🌟 THÊM ACTION NÀY ĐỂ TRẢ DANH SÁCH DESIGNER ĐỘNG CHO BOT
+      case "designers":
+        return jsonResponse(getDesignersWithChannels());
+
+      default:
+        return jsonResponse({
+          success: false,
+          message: "Invalid action"
+        });
+    }
+  } catch (err) {
+    return jsonResponse({
+      success: false,
+      error: err.message
+    });
+  }
+}
+
+// ===============================
+// DO POST
+// ===============================
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var action = data.action || "";
+
+    switch (action) {
+      case "assign":
+        return jsonResponse(assignDesigner(data.requestId, data.designer));
+
+      case "autoAssign":
+        // API mới: Tự động chọn Designer tối ưu nhất cho Task
+        return jsonResponse(smartAssignTask(data.requestId));
+
+      case "status":
+        return jsonResponse(updateStatus(data.requestId, data.status));
+
+      case "discordInfo":
+        return jsonResponse(saveDiscordInfo(data));
+
+      case "task":
+        return jsonResponse(getTaskById(data.requestId));
+
+      default:
+        return jsonResponse({
+          success: false,
+          message: "Invalid action"
+        });
+    }
+  } catch (err) {
+    return jsonResponse({
+      success: false,
+      error: err.message
+    });
+  }
+}
+
+// ===============================
+// GET UNSYNCED TASKS
+// ===============================
+function getUnsyncedTasks() {
+  var sh = getTaskSheet();
+  if (!sh) return [];
+
+  var lastRow = sh.getLastRow();
+  if (lastRow < 5) return [];
+
+  var maxColumns = Math.max(sh.getLastColumn(), 29);
+  var data = sh.getRange(5, 1, lastRow - 4, maxColumns).getValues();
+
+  var result = [];
+  var syncStatusIndex = COL.SYNC_STATUS - 1;
+  var requestIdIndex = COL.REQUEST_ID - 1;
+
+  data.forEach(function(r) {
+    var syncStatus = String(r[syncStatusIndex] || "").trim().toUpperCase();
+    var requestId = String(r[requestIdIndex] || "").trim();
+
+    if (requestId && syncStatus !== "SYNCED") {
+      // Kèm theo gợi ý Designer tốt nhất ngay trong payload gửi sang Discord
+      var suggestedPic = (typeof suggestBestDesignerForBrand === "function") ? suggestBestDesignerForBrand(r[4]) : "";
+      result.push({
+        requestId        : r[1],
+        sender           : r[2],
+        team             : r[3],
+        brand            : r[4],
+        category         : r[5],
+        note             : r[6],
+        orderDate        : r[7],
+        deadline         : r[8],
+        priority         : r[9],
+        format           : r[10],
+        quantity         : r[11],
+        brief            : r[12],
+        fileRef          : r[13],
+        designer         : r[14],
+        status           : r[15],
+        round            : r[16],
+        suggestedDesigner: suggestedPic
+      });
+    }
+  });
+  return result;
+}
+
+// ===============================
+// GET TASK BY ID
+// ===============================
+function getTaskById(requestId) {
+  var row = findTaskRow(requestId);
+  if (!row) return {};
+
+  var sh = getTaskSheet();
+  var r = sh.getRange(row, 1, 1, 29).getValues()[0];
+
+  var richLink = null;
+  try {
+    var richVal = sh.getRange(row, COL.FINAL_LINK).getRichTextValue();
+    if (richVal) richLink = richVal.getLinkUrl();
+  } catch (e) {}
+
+  return {
+    requestId : r[1],
+    sender    : r[2],
+    team      : r[3],
+    brand     : r[4],
+    category  : r[5],
+    note      : r[6],
+    orderDate : r[7],
+    deadline  : r[8],
+    priority  : r[9],
+    format    : r[10],
+    quantity  : r[11],
+    brief     : r[12],
+    fileRef   : r[13],
+    designer  : r[14],
+    status    : r[15],
+    round     : r[16],
+    finalLink : richLink || r[21],
+    threadId  : r[24],
+    threadUrl : r[26]
+  };
+}
+
+// ===============================
+// SMART AUTO-ASSIGN SINGLE TASK
+// ===============================
+function smartAssignTask(requestId) {
+  var row = findTaskRow(requestId);
+  if (!row) return { success: false, message: "Task not found" };
+
+  var sh = getTaskSheet();
+  var brand = sh.getRange(row, 5).getValue();
+  var suggestion = (typeof suggestBestDesignerForBrand === "function") ? suggestBestDesignerForBrand(brand) : "HUYNH";
+  var bestDesigner = suggestion.split(" (")[0].trim();
+
+  var res = assignDesigner(requestId, bestDesigner);
+  res.assignedDesigner = bestDesigner;
+  res.suggestionDetail = suggestion;
+  return res;
+}
+
+// ===============================
+// ASSIGN DESIGNER
+// ===============================
+function assignDesigner(requestId, designer) {
+  var row = findTaskRow(requestId);
+  if (!row) {
+    return { success: false, message: "Task not found" };
+  }
+
+  var spreadsheet = getSpreadsheet();
+  var sh = spreadsheet.getSheetByName(TASK_SHEET);
+  var now = new Date();
+
+  sh.getRange(row, COL.DESIGNER, 1, 2).setValues([[designer, "Assigned"]]);
+
+  if (typeof appendTimestamp === "function") {
+    appendTimestamp(sh, row, COL.ASSIGNED_DATE);
+  } else {
+    sh.getRange(row, COL.ASSIGNED_DATE).setValue(now);
+  }
+
+  sh.getRange(row, COL.LAST_UPDATE).setValue(now);
+  SpreadsheetApp.flush();
+
+  try {
+    if (typeof writeLog === "function") {
+      writeLog("Assign Designer (Discord)", requestId, "Giao task cho PIC: " + designer);
+    }
+  } catch (e) {}
+
+  try {
+    dispatchToDesigner(spreadsheet, requestId);
+  } catch (err) {
+    Logger.log("DISPATCH ERROR: " + err);
+  }
+
+  try {
+    if (typeof syncLeaderboard === "function") syncLeaderboard();
+  } catch (err) {}
+
+  return { success: true, designer: designer };
+}
+
+// ===============================
+// UPDATE STATUS (Tự động nhảy Round khi chọn Revision trên Discord)
+// ===============================
+function updateStatus(requestId, status) {
+  var row = findTaskRow(requestId);
+  if (!row) {
+    return { success: false, message: "Task not found" };
+  }
+
+  var spreadsheet = getSpreadsheet();
+  var sh = spreadsheet.getSheetByName(TASK_SHEET);
+  var now = new Date();
+  var cleanStatus = String(status || "").trim();
+
+  sh.getRange(row, COL.STATUS).setValue(cleanStatus);
+
+  var isStarting = (cleanStatus === "Doing" || cleanStatus === "In Progress");
+  var isReviewing = (cleanStatus === "Review");
+  var isDone = (cleanStatus === "Done");
+  var isRevision = (cleanStatus === "Revision");
+
+  if (typeof appendTimestamp === "function") {
+    if (isStarting) appendTimestamp(sh, row, COL.START_TIME);
+    if (isReviewing) appendTimestamp(sh, row, COL.REVIEW_TIME);
+    if (isDone) appendTimestamp(sh, row, COL.DONE_TIME);
+  } else {
+    if (isStarting) sh.getRange(row, COL.START_TIME).setValue(now);
+    if (isReviewing) sh.getRange(row, COL.REVIEW_TIME).setValue(now);
+    if (isDone) sh.getRange(row, COL.DONE_TIME).setValue(now);
+  }
+
+  // 🌟 TÍNH NĂNG #3: Tự động nhảy số Round khi bấm Revision trên Discord
+  var updatedRound = sh.getRange(row, COL.ROUND).getValue();
+  if (isRevision) {
+    updatedRound = (typeof getNextRoundText === "function")
+      ? getNextRoundText(updatedRound)
+      : "Round 2";
+    sh.getRange(row, COL.ROUND).setValue(updatedRound);
+  }
+
+  sh.getRange(row, COL.LAST_UPDATE).setValue(now);
+  SpreadsheetApp.flush();
+
+  try {
+    if (typeof writeLog === "function") {
+      var logMsg = "Đổi trạng thái thành: " + cleanStatus + (isRevision ? " (Tự tăng lên " + updatedRound + ")" : "");
+      writeLog("Update Status (Discord)", requestId, logMsg);
+    }
+  } catch (e) {}
+
+  try {
+    dispatchToDesigner(spreadsheet, requestId);
+  } catch (err) {
+    Logger.log("DISPATCH ERROR: " + err);
+  }
+
+  try {
+    if (typeof syncLeaderboard === "function") syncLeaderboard();
+  } catch (err) {}
+
+  return { success: true, status: cleanStatus, round: updatedRound };
+}
+
+// ===============================
+// SAVE DISCORD INFO
+// ===============================
+function saveDiscordInfo(data) {
+  if (!data || !data.requestId) {
+    return { success: false, message: "Missing requestId" };
+  }
+
+  var row = findTaskRow(data.requestId);
+  if (!row) {
+    return { success: false, message: "Task row not found" };
+  }
+
+  var spreadsheet = getSpreadsheet();
+  var sh = spreadsheet.getSheetByName(TASK_SHEET);
+  var currentDiscordCols = sh.getRange(row, COL.MESSAGE_ID, 1, 7).getValues()[0];
+
+  var updatedDiscordCols = [[
+    data.messageId  || currentDiscordCols[0] || "", // Cột W (23)
+    data.channelId  || currentDiscordCols[1] || "", // Cột X (24)
+    data.threadId   || currentDiscordCols[2] || "", // Cột Y (25)
+    data.messageUrl || currentDiscordCols[3] || "", // Cột Z (26)
+    data.threadUrl  || currentDiscordCols[4] || "", // Cột AA (27)
+    "SYNCED",                                       // Cột AB (28)
+    new Date()                                      // Cột AC (29)
+  ]];
+
+  sh.getRange(row, COL.MESSAGE_ID, 1, 7).setValues(updatedDiscordCols);
+  SpreadsheetApp.flush();
+
+  // Nếu task đã có PIC, đẩy luôn Thread URL xuống Cột R của Sheet Designer
+  try {
+    dispatchToDesigner(spreadsheet, data.requestId);
+  } catch (e) {}
+
+  return { success: true };
+}
+
+// ===============================
+// FIND ROW
+// ===============================
+function findTaskRow(requestId) {
+  if (!requestId) return null;
+  var sh = getTaskSheet();
+  var lastRow = sh.getLastRow();
+  if (lastRow < 5) return null;
+
+  var ids = sh.getRange(5, COL.REQUEST_ID, lastRow - 4, 1).getValues();
+  var target = String(requestId).trim().toUpperCase();
+
+  for (var i = 0; i < ids.length; i++) {
+    if (String(ids[i][0]).trim().toUpperCase() === target) {
+      return i + 5;
+    }
+  }
+  return null;
+}
+
+// ===============================
+// JSON RESPONSE
+// ===============================
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// HÀM LẤY DANH SÁCH DESIGNER VÀ CHANNEL ID ĐỘNG TỪ SHEET SETTINGS
+// ══════════════════════════════════════════════════════════════════════
+function getDesignersWithChannels() {
+  try {
+    var ss = getSpreadsheet();
+    var sh = ss.getSheetByName("SETTINGS");
+    if (!sh || sh.getLastRow() < 2) return [];
+
+    // Đọc từ dòng 2: Cột A (Tên - 1) đến Cột C (Channel ID - 3)
+    var data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues();
+    var result = [];
+
+    for (var i = 0; i < data.length; i++) {
+      var name = String(data[i][0] || "").trim().toUpperCase();
+      var channelId = String(data[i][2] || "").trim(); // Cột C
+      if (name) {
+        result.push({
+          name: name,
+          channelId: channelId
+        });
+      }
+    }
+    return result;
+  } catch (err) {
+    Logger.log("Lỗi getDesignersWithChannels: " + err);
+    return [];
+  }
+}

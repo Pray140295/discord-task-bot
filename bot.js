@@ -24,6 +24,17 @@ const cfg = {
   sendEnabled: String(process.env.DISCORD_SYNC_SEND_ENABLED || '').toLowerCase() === 'true',
   sendAllowlist: new Set(String(process.env.DISCORD_SYNC_ALLOWLIST || '').split(',').map(value => value.trim()).filter(Boolean))
 };
+// DISCORD-GATEWAY-DIAG-06A — diagnostic read-only guard.
+// Fail closed: absent, empty or unrecognized values keep the guard enabled.
+// Only an explicit DISCORD_DIAGNOSTIC_READ_ONLY=false may lift it.
+// Task-send settings (DISCORD_SYNC_SEND_ENABLED / DISCORD_SYNC_ALLOWLIST) never affect this flag.
+const DIAGNOSTIC_WRITE_ACTIONS = new Set(['assign','status','claimSync','discordInfo']);
+const diagnosticReadOnly = (() => {
+  const value = process.env.DISCORD_DIAGNOSTIC_READ_ONLY;
+  if (value === undefined || value === null || String(value).trim() === '') return true;
+  return String(value).trim().toLowerCase() !== 'false';
+})();
+console.log('DISCORD_DIAGNOSTIC_READ_ONLY', { enabled: diagnosticReadOnly });
 // Discord message creation is not safe to retry after an ambiguous network failure.
 const client = new Client({
   intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent],
@@ -39,6 +50,9 @@ function apiProblem(action, data) {
   throw new Error(`${action}: ${msg}`);
 }
 async function api(action, data = {}) {
+  if (diagnosticReadOnly && DIAGNOSTIC_WRITE_ACTIONS.has(action)) {
+    throw new Error(`DIAGNOSTIC_READ_ONLY: write action blocked (${action})`);
+  }
   const res = await axios.post(cfg.url, { ...data, action, apiToken: cfg.token }, {
     timeout: 30000, maxRedirects: 5, headers:{'Content-Type':'application/json'}
   });
@@ -152,6 +166,10 @@ async function scanRecentTasks(channel, limit=300) {
   return {found,duplicate};
 }
 async function duplicateReport() {
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: duplicate audit skipped');
+    return 0;
+  }
   const channel=await client.channels.fetch(cfg.newChannel);
   if (!channel || !channel.messages) throw new Error('New task channel is not a text channel');
   const {duplicate}=await scanRecentTasks(channel);
@@ -162,6 +180,10 @@ const processing = new Set();
 let polling = false;
 const warnings = new Set();
 async function poll() {
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: poll skipped');
+    return;
+  }
   if (polling) return;
   polling=true;
   try {
@@ -216,6 +238,10 @@ async function poll() {
   finally { polling=false; }
 }
 function startPolling() {
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: polling loop not started');
+    return;
+  }
   const loop=async()=>{ await poll(); setTimeout(loop,15000); };
   loop().catch(err=>console.error('POLL LOOP ERROR:',err));
 }
@@ -227,6 +253,7 @@ async function hasManagerRole(interaction) {
   } catch(err) { console.error('Role lookup failed:',err.message); return false; }
 }
 async function ensureDesignerNotification(designer,requestId) {
+  if (diagnosticReadOnly) throw new Error('DIAGNOSTIC_READ_ONLY: designer notification blocked');
   const list=await getDesigners(true);
   const d=list.find(x=>x.name.normalize('NFC').toUpperCase() === designer.normalize('NFC').toUpperCase());
   if (!d || !/^\d{15,22}$/.test(String(d.channelId||''))) throw new Error('Missing designer CHANNEL ID in SETTINGS column E');
@@ -240,6 +267,7 @@ async function ensureDesignerNotification(designer,requestId) {
   return true;
 }
 async function notifyChannel(channelId,text) {
+  if (diagnosticReadOnly) throw new Error('DIAGNOSTIC_READ_ONLY: channel notification blocked');
   const channel=await client.channels.fetch(channelId);
   if (!channel || typeof channel.send !== 'function') throw new Error('Notification channel inaccessible');
   await channel.send({content:text,allowedMentions:{parse:[]}});
@@ -248,7 +276,12 @@ async function notifyChannel(channelId,text) {
 client.on('messageCreate',async message=>{
   if (message.author.bot) return;
   const command = message.content.trim().split(/\s+/);
-  if (!['!checkdup','!cleandup','!notify','!reconcile'].includes(command[0])) return;
+  const knownCommand = ['!checkdup','!cleandup','!notify','!reconcile'].includes(command[0]);
+  if (!knownCommand) return;
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: command blocked', command[0]);
+    return;
+  }
   if (!message.member?.roles?.cache?.has(cfg.managerRoleId)) return message.reply('❌ Không có quyền.');
   try {
     if (command[0] === '!notify') {
@@ -280,6 +313,10 @@ client.on('interactionCreate',async interaction=>{
   const isAssign=customId.startsWith('assign_');
   const isStatus=customId.startsWith('status:') || customId.startsWith('status_');
   if (!isAssign && !isStatus) return;
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: interaction blocked', customId);
+    return;
+  }
   try {
     await interaction.deferReply({ephemeral:true}); // acknowledge within 3 seconds
     const manager=await hasManagerRole(interaction);
@@ -339,6 +376,10 @@ client.on('interactionCreate',async interaction=>{
 });
 client.once("clientReady", async () => {
   console.log('Logged in:',client.user.tag);
+  if (diagnosticReadOnly) {
+    console.log('DISCORD_DIAGNOSTIC_READ_ONLY_ACTIVE: duplicate audit and polling disabled');
+    return;
+  }
   duplicateReport().catch(err=>console.error('Initial duplicate audit:',err.message));
   startPolling();
 });

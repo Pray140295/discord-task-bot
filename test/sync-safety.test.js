@@ -6,7 +6,7 @@ const vm = require('node:vm');
 
 const BOT_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'bot.js'), 'utf8');
 const APPS_SCRIPT_SOURCE = fs.readFileSync(
-  path.join(__dirname, '..', '..', 'sources', 'DiscordAPI.gs.txt'),
+  path.join(__dirname, 'fixtures', 'DiscordAPI.available-snapshot.gs.txt'),
   'utf8'
 );
 const SYNC_03A_SOURCE = fs.readFileSync(
@@ -88,6 +88,7 @@ function loadBot({ channel, apiHandler, sendEnabled = true, allowlist = TEST_ALL
     channels: { fetch: async () => channel },
     on: (event, handler) => { handlers[event] = handler; },
     once: (event, handler) => { handlers[event] = handler; },
+    rest: { on() {} },
     login: async () => undefined,
     isReady: () => true
   };
@@ -126,7 +127,9 @@ function loadBot({ channel, apiHandler, sendEnabled = true, allowlist = TEST_ALL
         CHANNEL_REVIEW: 'review-channel',
         CHANNEL_DONE: 'done-channel',
         DISCORD_SYNC_SEND_ENABLED: sendEnabled ? 'true' : '',
-        DISCORD_SYNC_ALLOWLIST: allowlist
+        DISCORD_SYNC_ALLOWLIST: allowlist,
+        // These tests exercise the send path; DIAG-06A defaults to read-only.
+        DISCORD_DIAGNOSTIC_READ_ONLY: 'false'
       },
       exitCode: 0
     },
