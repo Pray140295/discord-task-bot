@@ -22,10 +22,64 @@ const cfg = {
   reviewChannel: process.env.CHANNEL_REVIEW,
   doneChannel: process.env.CHANNEL_DONE
 };
-const client = new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent]});
+// DIAG-06E RECOVERY-07A - read-only guard. Fail closed: absent, empty, unrecognized => guard ON.
+// Only an explicit DISCORD_DIAGNOSTIC_READ_ONLY=false may lift it.
+// Task-send settings (DISCORD_SYNC_SEND_ENABLED / DISCORD_SYNC_ALLOWLIST) never affect this flag.
+const DIAGNOSTIC_WRITE_ACTIONS = new Set(['assign','status','claimSync','discordInfo']);
+const diagnosticReadOnly = (() => {
+  const value = process.env.DISCORD_DIAGNOSTIC_READ_ONLY;
+  if (value === undefined || value === null || String(value).trim() === '') return true;
+  return String(value).trim().toLowerCase() !== 'false';
+})();
+console.log('DISCORD_DIAGNOSTIC_READ_ONLY', { enabled: diagnosticReadOnly });
+const client = new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent],rest:{retries:0, rejectOnRateLimit:(d)=>Boolean(d)&&d.route==='/gateway/bot', invalidRequestWarningInterval:100, timeout:15e3, offset:50, globalRequestsPerSecond:50}});
+// DIAG-06E-P2c-R13 PATCH B - bounded gateway 429 + safe observability.
+// No extra requests, no credential logging, no auto re-login, no process exit on 429.
+// R15: /ping always HTTP 200; login failure logs allowlisted error name + code only (no message payload).
+let loginStopped = false;
+let bResponsesLogged = 0, bRateLimitsLogged = 0, bInvalidLogged = 0;
+const isGatewayRoute = path => typeof path === 'string' && path.split('?')[0] === '/gateway/bot';
+const isRateLimitError = err => Boolean(err) && typeof err.name === 'string' && err.name.startsWith('RateLimitError');
+const safeHeader = (headers, key) => { try { const v = headers && typeof headers.get === 'function' ? headers.get(key) : null; return v === null || v === undefined ? null : String(v).slice(0, 60); } catch (_) { return null; } };
+const B_ALLOWED_ERROR_NAMES = new Set(['Error','TypeError','RangeError','SyntaxError','AbortError','DiscordAPIError','HTTPError','RateLimitError']);
+const B_ALLOWED_ERROR_CODES = new Set(['ABORT_ERR','ECONNRESET','ETIMEDOUT','ENOTFOUND','ECONNREFUSED','ECONNABORTED','EHOSTUNREACH','ENETDOWN','EAI_AGAIN']);
+const safeErrorName = err => { const n = String((err && err.name) || '').split('[')[0]; return B_ALLOWED_ERROR_NAMES.has(n) ? n : 'Error'; };
+const safeErrorCode = err => { const c = err && err.code; if (typeof c === 'string') return B_ALLOWED_ERROR_CODES.has(c) ? c : null; return Number.isInteger(c) ? c : null; };
+client.rest.on('response', (request, response) => {
+  if (bResponsesLogged >= 3 || !isGatewayRoute(request && request.path)) return;
+  bResponsesLogged++;
+  console.log('B_REST_RESPONSE', {
+    n: bResponsesLogged,
+    route: String((request && request.route) || '').slice(0, 60),
+    status: response && response.status !== undefined ? response.status : null,
+    retryAfterHeader: safeHeader(response && response.headers, 'retry-after'),
+    scope: safeHeader(response && response.headers, 'x-ratelimit-scope'),
+    globalHeader: safeHeader(response && response.headers, 'x-ratelimit-global'),
+    contentType: safeHeader(response && response.headers, 'content-type')
+  });
+});
+client.rest.on('rateLimited', info => {
+  if (bRateLimitsLogged >= 3) return;
+  bRateLimitsLogged++;
+  console.log('B_RATE_LIMITED', {
+    n: bRateLimitsLogged,
+    route: String((info && info.route) || '').slice(0, 60),
+    method: String((info && info.method) || '').slice(0, 10),
+    global: Boolean(info && info.global),
+    scope: String((info && info.scope) || '').slice(0, 20),
+    retryAfterMs: Number(info && info.retryAfter),
+    timeToResetMs: Number(info && info.timeToReset),
+    limit: Number.isFinite(info && info.limit) ? Number(info.limit) : 'inf'
+  });
+});
+client.rest.on('invalidRequestWarning', info => {
+  if (bInvalidLogged >= 5) return;
+  bInvalidLogged++;
+  console.log('B_INVALID_REQUEST_WARNING', { n: bInvalidLogged, count: Number(info && info.count), remainingTimeMs: Number(info && info.remainingTime) });
+});
 const app = express();
 app.get('/', (_req,res) => res.send('Bot Online'));
-app.get('/ping', (_req,res) => res.status(client.isReady()?200:503).send(client.isReady()?'pong':'Discord not connected'));
+app.get('/ping', (_req,res) => res.status(200).json({ ready: client.isReady(), guardEnabled: diagnosticReadOnly, loginStopped }));
 app.listen(Number(process.env.PORT) || 3000, () => console.log('Health server ready'));
 
 function apiProblem(action, data) {
@@ -33,6 +87,9 @@ function apiProblem(action, data) {
   throw new Error(`${action}: ${msg}`);
 }
 async function api(action, data = {}) {
+  if (diagnosticReadOnly && DIAGNOSTIC_WRITE_ACTIONS.has(action)) {
+    throw new Error(`DIAGNOSTIC_READ_ONLY: write action blocked (${action})`);
+  }
   const res = await axios.post(cfg.url, { ...data, action, apiToken: cfg.token }, {
     timeout: 30000, maxRedirects: 5, headers:{'Content-Type':'application/json'}
   });
@@ -130,6 +187,10 @@ async function scanRecentTasks(channel, limit=300) {
   return {found,duplicate};
 }
 async function duplicateReport() {
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: duplicate audit skipped');
+    return 0;
+  }
   const channel=await client.channels.fetch(cfg.newChannel);
   if (!channel || !channel.messages) throw new Error('New task channel is not a text channel');
   const {duplicate}=await scanRecentTasks(channel);
@@ -140,6 +201,10 @@ const processing = new Set();
 let polling = false;
 const warnings = new Set();
 async function poll() {
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: poll skipped');
+    return;
+  }
   if (polling) return;
   polling=true;
   try {
@@ -185,6 +250,10 @@ async function poll() {
   finally { polling=false; }
 }
 function startPolling() {
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: polling loop not started');
+    return;
+  }
   const loop=async()=>{ await poll(); setTimeout(loop,15000); };
   loop().catch(err=>console.error('POLL LOOP ERROR:',err));
 }
@@ -196,6 +265,7 @@ async function hasManagerRole(interaction) {
   } catch(err) { console.error('Role lookup failed:',err.message); return false; }
 }
 async function ensureDesignerNotification(designer,requestId) {
+  if (diagnosticReadOnly) throw new Error('DIAGNOSTIC_READ_ONLY: designer notification blocked');
   const list=await getDesigners(true);
   const d=list.find(x=>x.name.normalize('NFC').toUpperCase() === designer.normalize('NFC').toUpperCase());
   if (!d || !/^\d{15,22}$/.test(String(d.channelId||''))) throw new Error('Missing designer CHANNEL ID in SETTINGS column E');
@@ -209,6 +279,7 @@ async function ensureDesignerNotification(designer,requestId) {
   return true;
 }
 async function notifyChannel(channelId,text) {
+  if (diagnosticReadOnly) throw new Error('DIAGNOSTIC_READ_ONLY: channel notification blocked');
   const channel=await client.channels.fetch(channelId);
   if (!channel || typeof channel.send !== 'function') throw new Error('Notification channel inaccessible');
   await channel.send({content:text,allowedMentions:{parse:[]}});
@@ -218,6 +289,10 @@ client.on('messageCreate',async message=>{
   if (message.author.bot) return;
   const command = message.content.trim().split(/\s+/);
   if (!['!checkdup','!cleandup','!notify','!reconcile'].includes(command[0])) return;
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: command blocked', command[0]);
+    return;
+  }
   if (!message.member?.roles?.cache?.has(cfg.managerRoleId)) return message.reply('❌ Không có quyền.');
   try {
     if (command[0] === '!notify') {
@@ -248,6 +323,10 @@ client.on('interactionCreate',async interaction=>{
   const isAssign=customId.startsWith('assign_');
   const isStatus=customId.startsWith('status:') || customId.startsWith('status_');
   if (!isAssign && !isStatus) return;
+  if (diagnosticReadOnly) {
+    console.log('DIAGNOSTIC_READ_ONLY: interaction blocked', customId);
+    return;
+  }
   try {
     await interaction.deferReply({ephemeral:true}); // acknowledge within 3 seconds
     const manager=await hasManagerRole(interaction);
@@ -307,7 +386,28 @@ client.on('interactionCreate',async interaction=>{
 });
 client.once("clientReady", async () => {
   console.log('Logged in:',client.user.tag);
+  if (diagnosticReadOnly) {
+    console.log('DISCORD_DIAGNOSTIC_READ_ONLY_ACTIVE: duplicate audit and polling disabled');
+    return;
+  }
   duplicateReport().catch(err=>console.error('Initial duplicate audit:',err.message));
   startPolling();
 });
-client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
+function loginOnce() {
+  return client.login(process.env.DISCORD_TOKEN).then(() => { console.log('B_LOGIN_OK'); })
+    .catch(err => {
+      const rl = isRateLimitError(err);
+      console.log('B_LOGIN_STOP', {
+        rateLimited: rl,
+        route: rl ? String(err.route || '').slice(0, 60) : null,
+        retryAfterMs: rl ? Number(err.retryAfter) : null,
+        timeToResetMs: rl ? Number(err.timeToReset) : null,
+        scope: rl ? String(err.scope || '').slice(0, 20) : null,
+        global: rl ? Boolean(err.global) : null,
+        label: safeErrorName(err),
+        code: safeErrorCode(err)
+      });
+      loginStopped = true;
+    });
+}
+loginOnce();
