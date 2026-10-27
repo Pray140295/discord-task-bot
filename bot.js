@@ -32,10 +32,54 @@ const diagnosticReadOnly = (() => {
   return String(value).trim().toLowerCase() !== 'false';
 })();
 console.log('DISCORD_DIAGNOSTIC_READ_ONLY', { enabled: diagnosticReadOnly });
-const client = new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent],rest:{retries:0}});
+const client = new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent],rest:{retries:0, rejectOnRateLimit:(d)=>Boolean(d)&&d.route==='/gateway/bot', invalidRequestWarningInterval:100, timeout:15e3, offset:50, globalRequestsPerSecond:50}});
+// DIAG-06E-P2c-R13 PATCH B - bounded gateway 429 + safe observability.
+// No extra requests, no credential logging, no auto re-login, no process exit on 429.
+// R15: /ping always HTTP 200; login failure logs allowlisted error name + code only (no message payload).
+let loginStopped = false;
+let bResponsesLogged = 0, bRateLimitsLogged = 0, bInvalidLogged = 0;
+const isGatewayRoute = path => typeof path === 'string' && path.split('?')[0] === '/gateway/bot';
+const isRateLimitError = err => Boolean(err) && typeof err.name === 'string' && err.name.startsWith('RateLimitError');
+const safeHeader = (headers, key) => { try { const v = headers && typeof headers.get === 'function' ? headers.get(key) : null; return v === null || v === undefined ? null : String(v).slice(0, 60); } catch (_) { return null; } };
+const B_ALLOWED_ERROR_NAMES = new Set(['Error','TypeError','RangeError','SyntaxError','AbortError','DiscordAPIError','HTTPError','RateLimitError']);
+const B_ALLOWED_ERROR_CODES = new Set(['ABORT_ERR','ECONNRESET','ETIMEDOUT','ENOTFOUND','ECONNREFUSED','ECONNABORTED','EHOSTUNREACH','ENETDOWN','EAI_AGAIN']);
+const safeErrorName = err => { const n = String((err && err.name) || '').split('[')[0]; return B_ALLOWED_ERROR_NAMES.has(n) ? n : 'Error'; };
+const safeErrorCode = err => { const c = err && err.code; if (typeof c === 'string') return B_ALLOWED_ERROR_CODES.has(c) ? c : null; return Number.isInteger(c) ? c : null; };
+client.rest.on('response', (request, response) => {
+  if (bResponsesLogged >= 3 || !isGatewayRoute(request && request.path)) return;
+  bResponsesLogged++;
+  console.log('B_REST_RESPONSE', {
+    n: bResponsesLogged,
+    route: String((request && request.route) || '').slice(0, 60),
+    status: response && response.status !== undefined ? response.status : null,
+    retryAfterHeader: safeHeader(response && response.headers, 'retry-after'),
+    scope: safeHeader(response && response.headers, 'x-ratelimit-scope'),
+    globalHeader: safeHeader(response && response.headers, 'x-ratelimit-global'),
+    contentType: safeHeader(response && response.headers, 'content-type')
+  });
+});
+client.rest.on('rateLimited', info => {
+  if (bRateLimitsLogged >= 3) return;
+  bRateLimitsLogged++;
+  console.log('B_RATE_LIMITED', {
+    n: bRateLimitsLogged,
+    route: String((info && info.route) || '').slice(0, 60),
+    method: String((info && info.method) || '').slice(0, 10),
+    global: Boolean(info && info.global),
+    scope: String((info && info.scope) || '').slice(0, 20),
+    retryAfterMs: Number(info && info.retryAfter),
+    timeToResetMs: Number(info && info.timeToReset),
+    limit: Number.isFinite(info && info.limit) ? Number(info.limit) : 'inf'
+  });
+});
+client.rest.on('invalidRequestWarning', info => {
+  if (bInvalidLogged >= 5) return;
+  bInvalidLogged++;
+  console.log('B_INVALID_REQUEST_WARNING', { n: bInvalidLogged, count: Number(info && info.count), remainingTimeMs: Number(info && info.remainingTime) });
+});
 const app = express();
 app.get('/', (_req,res) => res.send('Bot Online'));
-app.get('/ping', (_req,res) => res.status(client.isReady()?200:503).send(client.isReady()?'pong':'Discord not connected'));
+app.get('/ping', (_req,res) => res.status(200).json({ ready: client.isReady(), guardEnabled: diagnosticReadOnly, loginStopped }));
 app.listen(Number(process.env.PORT) || 3000, () => console.log('Health server ready'));
 
 function apiProblem(action, data) {
@@ -349,4 +393,21 @@ client.once("clientReady", async () => {
   duplicateReport().catch(err=>console.error('Initial duplicate audit:',err.message));
   startPolling();
 });
-client.login(process.env.DISCORD_TOKEN).catch(err=>{console.error('Discord login failed:',err.message);process.exitCode=1;});
+function loginOnce() {
+  return client.login(process.env.DISCORD_TOKEN).then(() => { console.log('B_LOGIN_OK'); })
+    .catch(err => {
+      const rl = isRateLimitError(err);
+      console.log('B_LOGIN_STOP', {
+        rateLimited: rl,
+        route: rl ? String(err.route || '').slice(0, 60) : null,
+        retryAfterMs: rl ? Number(err.retryAfter) : null,
+        timeToResetMs: rl ? Number(err.timeToReset) : null,
+        scope: rl ? String(err.scope || '').slice(0, 20) : null,
+        global: rl ? Boolean(err.global) : null,
+        label: safeErrorName(err),
+        code: safeErrorCode(err)
+      });
+      loginStopped = true;
+    });
+}
+loginOnce();
